@@ -1,0 +1,2 @@
+﻿- adicionado logica de processamento de linhas em paralelo
+- adicionado a logica de escolher qual produto roda em qual linha
