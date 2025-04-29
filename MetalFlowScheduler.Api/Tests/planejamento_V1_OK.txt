@@ -1,0 +1,339 @@
+﻿using Google.OrTools.Sat;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+class Program
+{
+    static void Main()
+    {
+        // Dados
+        DateTime startDate = new DateTime(2025, 4, 29, 6, 0, 0);
+        int planningHorizonMinutes = 80 * 60; // 80 horas - Horizonte máximo para as variáveis
+        // Definir o deadline para o planejamento
+        DateTime deadlineDate = new DateTime(2025, 5, 2, 13, 0, 0); // Exemplo: 2 de Maio de 2025, 18:00
+
+        // Calcular o deadline em minutos a partir da data de início
+        int deadlineMinutes = (int)(deadlineDate - startDate).TotalMinutes;
+
+        // Garantir que o deadline não exceda o horizonte de planejamento definido para as variáveis
+        // int effectivePlanningLimit = Math.Min(planningHorizonMinutes, deadlineMinutes); // Não usado diretamente na modelagem das variáveis
+
+
+        var products = new List<Product>
+        {
+            new Product("VAT30", 100, 50),
+            new Product("VD500", 100, 60),
+            new Product("SX650", 100, 70)
+        };
+
+        // Definir as operações na ordem correta
+        var operations = new List<Operation>
+        {
+            new Operation("Fusao", 10M, 15), // Aciaria Op1
+            new Operation("Aquecimento", 10M, 15), // Aciaria Op2
+            new Operation("Extrusao", 10M, 15), // Laminacao Op1
+            new Operation("Corte", 10M, 15) // Laminacao Op2
+        };
+
+        // Definir os WorkCenters e associar as operações
+        // Usamos GetRange para simular o Slice
+        var workCenters = new List<WorkCenter>
+        {
+            new WorkCenter("Aciaria", operations.GetRange(0, 2)), // Fusao, Aquecimento
+            new WorkCenter("Laminacao", operations.GetRange(2, 2)) // Extrusao, Corte
+        };
+
+        var model = new CpModel();
+
+        // Variáveis de Intervalo para cada operação de cada produto
+        var intervalVars = new Dictionary<(string product, string operation), IntervalVar>();
+        var startVars = new Dictionary<(string product, string operation), IntVar>();
+        var endVars = new Dictionary<(string product, string operation), IntVar>();
+
+        // Novas variáveis booleanas para os status de cada produto em relação ao deadline
+        var finishedByDeadlineVars = new Dictionary<string, BoolVar>();
+        var startedAfterDeadlineVars = new Dictionary<string, BoolVar>();
+
+        // Variáveis booleanas para a ordem dos produtos dentro de cada WorkCenter
+        // p1Beforep2InWC[p1.Name, p2.Name, wc.Name] é true se p1 vem antes de p2 no WorkCenter wc
+        var p1Beforep2InWC = new Dictionary<(string p1, string p2, string wc), BoolVar>();
+
+
+        foreach (var product in products)
+        {
+            // Inicializa as variáveis de status para cada produto
+            finishedByDeadlineVars[product.Name] = model.NewBoolVar($"FinishedByDeadline_{product.Name}");
+            startedAfterDeadlineVars[product.Name] = model.NewBoolVar($"StartedAfterDeadline_{product.Name}");
+
+            foreach (var operation in operations)
+            {
+                // Calcular a duração da operação para este produto em minutos
+                long duration = Math.Max(1, (long)Math.Ceiling(product.Quantity / operation.Capacity * 60M));
+
+                // Criar a variável de intervalo para esta operação deste produto
+                var start = model.NewIntVar(0, planningHorizonMinutes, $"Start_{product.Name}_{operation.Name}");
+                var end = model.NewIntVar(0, planningHorizonMinutes, $"End_{product.Name}_{operation.Name}");
+                var interval = model.NewIntervalVar(start, duration, end, $"Interval_{product.Name}_{operation.Name}");
+
+                startVars[(product.Name, operation.Name)] = start;
+                endVars[(product.Name, operation.Name)] = end;
+                intervalVars[(product.Name, operation.Name)] = interval;
+            }
+        }
+
+        // Restrições: sequência das operações para cada produto
+        // Para cada produto, a próxima operação só pode começar após o fim da operação anterior.
+        foreach (var product in products)
+        {
+            for (int i = 0; i < operations.Count - 1; i++)
+            {
+                var op1 = operations[i];
+                var op2 = operations[i + 1];
+                model.Add(startVars[(product.Name, op2.Name)] >= endVars[(product.Name, op1.Name)]);
+            }
+        }
+
+        // Restrições: uma operação só pode atender um produto por vez (sem sobreposição)
+        // e aplicar tempo de setup entre produtos diferentes.
+        // Esta lógica permanece a mesma, aplicada a cada operação individualmente.
+        foreach (var operation in operations)
+        {
+            for (int i = 0; i < products.Count; i++)
+            {
+                for (int j = i + 1; j < products.Count; j++)
+                {
+                    var prod1 = products[i];
+                    var prod2 = products[j];
+
+                    // Variável booleana indicando se prod1 vem antes de prod2 nesta operação
+                    var prod1BeforeProd2Op = model.NewBoolVar($"Prod1BeforeProd2_{prod1.Name}_{prod2.Name}_{operation.Name}");
+
+                    var start1 = startVars[(prod1.Name, operation.Name)];
+                    var end1 = endVars[(prod1.Name, operation.Name)];
+                    var start2 = startVars[(prod2.Name, operation.Name)];
+                    var end2 = endVars[(prod2.Name, operation.Name)];
+
+                    long transitionTime = operation.SetupTime;
+
+                    model.Add(start2 >= end1 + transitionTime).OnlyEnforceIf(prod1BeforeProd2Op);
+                    model.Add(start1 >= end2 + transitionTime).OnlyEnforceIf(prod1BeforeProd2Op.Not());
+                }
+            }
+        }
+
+        // Restrições relacionadas aos WorkCenters
+        foreach (var wc in workCenters)
+        {
+            // Para cada par de produtos dentro deste WorkCenter
+            for (int i = 0; i < products.Count; i++)
+            {
+                for (int j = i + 1; j < products.Count; j++)
+                {
+                    var prod1 = products[i];
+                    var prod2 = products[j];
+
+                    // Variável booleana indicando se prod1 vem antes de prod2 neste WorkCenter
+                    var prod1BeforeProd2WC = model.NewBoolVar($"Prod1BeforeProd2WC_{prod1.Name}_{prod2.Name}_{wc.Name}");
+                    p1Beforep2InWC[(prod1.Name, prod2.Name, wc.Name)] = prod1BeforeProd2WC; // Armazena para uso posterior
+
+                    // Obter a primeira e a última operação deste WorkCenter
+                    var firstOpWC = wc.Operations.First();
+                    var lastOpWC = wc.Operations.Last();
+
+                    // Restrição 1: Sequência dentro do WorkCenter
+                    // Se prod1 vem antes de prod2 no WC, o início da primeira op de prod2 no WC
+                    // deve ser >= ao fim da última op de prod1 no WC.
+                    model.Add(startVars[(prod2.Name, firstOpWC.Name)] >= endVars[(prod1.Name, lastOpWC.Name)])
+                         .OnlyEnforceIf(prod1BeforeProd2WC);
+
+                    // Se prod2 vem antes de prod1 no WC, o início da primeira op de prod1 no WC
+                    // deve ser >= ao fim da última op de prod2 no WC.
+                    model.Add(startVars[(prod1.Name, firstOpWC.Name)] >= endVars[(prod2.Name, lastOpWC.Name)])
+                         .OnlyEnforceIf(prod1BeforeProd2WC.Not());
+                }
+            }
+        }
+
+        // Restrição 2: Bloqueio entre WorkCenters consecutivos
+        // Um produto não pode iniciar no WorkCenter Y se outro produto ainda estiver no WorkCenter X (Y segue X).
+        for (int k = 0; k < workCenters.Count - 1; k++)
+        {
+            var wc1 = workCenters[k]; // WorkCenter atual (X)
+            var wc2 = workCenters[k + 1]; // Próximo WorkCenter (Y)
+
+            var lastOpWC1 = wc1.Operations.Last();
+            var firstOpWC2 = wc2.Operations.First();
+
+            // Para cada par de produtos
+            for (int i = 0; i < products.Count; i++)
+            {
+                for (int j = i + 1; j < products.Count; j++)
+                {
+                    var prod1 = products[i];
+                    var prod2 = products[j];
+
+                    // Precisamos saber a ordem entre prod1 e prod2 no WorkCenter 1
+                    // Usamos a variável booleana definida anteriormente
+                    var prod1BeforeProd2WC1 = p1Beforep2InWC[(prod1.Name, prod2.Name, wc1.Name)];
+
+                    // Restrição: Se prod1 vem antes de prod2 no WC1, então prod2 só pode
+                    // iniciar no WC2 após prod1 terminar no WC1.
+                    model.Add(startVars[(prod2.Name, firstOpWC2.Name)] >= endVars[(prod1.Name, lastOpWC1.Name)])
+                         .OnlyEnforceIf(prod1BeforeProd2WC1);
+
+                    // Restrição: Se prod2 vem antes de prod1 no WC1, então prod1 só pode
+                    // iniciar no WC2 após prod2 terminar no WC1.
+                    model.Add(startVars[(prod1.Name, firstOpWC2.Name)] >= endVars[(prod2.Name, lastOpWC1.Name)])
+                         .OnlyEnforceIf(prod1BeforeProd2WC1.Not());
+
+                    // Note: Esta restrição já implica que um produto não pode "ultrapassar" outro
+                    // entre WorkCenters. Se prod1 está antes de prod2 no WC1, ele continuará
+                    // "antes" de prod2 na transição para o WC2 no sentido de bloqueio.
+                }
+            }
+        }
+
+
+        // Restrições para definir o status dos produtos em relação ao deadline
+        foreach (var product in products)
+        {
+            var firstOperation = operations.First();
+            var lastOperation = operations.Last();
+
+            // Um produto é FINALIZADO (finishedByDeadlineVars == true) SE E SOMENTE SE
+            // a última operação terminar no ou antes do deadline.
+            model.Add(endVars[(product.Name, lastOperation.Name)] <= deadlineMinutes).OnlyEnforceIf(finishedByDeadlineVars[product.Name]);
+            model.Add(endVars[(product.Name, lastOperation.Name)] > deadlineMinutes).OnlyEnforceIf(finishedByDeadlineVars[product.Name].Not());
+
+            // Um produto é NÃO PLANEJADO (startedAfterDeadlineVars == true) SE E SOMENTE SE
+            // a primeira operação começar após o deadline.
+            model.Add(startVars[(product.Name, firstOperation.Name)] > deadlineMinutes).OnlyEnforceIf(startedAfterDeadlineVars[product.Name]);
+            model.Add(startVars[(product.Name, firstOperation.Name)] <= deadlineMinutes).OnlyEnforceIf(startedAfterDeadlineVars[product.Name].Not());
+
+            // Se um produto começou antes ou no deadline E não foi finalizado pelo deadline,
+            // ele foi CONCLUIDO APOS DEADLINE ou PARCIALMENTE PLANEJADO.
+            // Não precisamos de uma variável booleana explícita para isso no modelo,
+            // podemos inferir isso na saída.
+        }
+
+
+        // Objetivo: maximizar lucro dos produtos FINALIZADOS dentro do deadline
+        // O lucro é a soma dos preços dos produtos que foram finalizados dentro do prazo.
+        LinearExpr objective = LinearExpr.Sum(products.ConvertAll(p => finishedByDeadlineVars[p.Name] * p.Price));
+        model.Maximize(objective);
+
+        // Solver
+        var solver = new CpSolver();
+        solver.StringParameters = "max_time_in_seconds:10.0"; // Aumentei um pouco o tempo limite
+        var status = solver.Solve(model);
+
+        // Exibir Resultados
+        if (status == CpSolverStatus.Optimal || status == CpSolverStatus.Feasible)
+        {
+            Console.WriteLine("\nResultado do Agendamento com WorkCenters e Deadline:\n");
+            Console.WriteLine($"Status do Solver: {status}");
+            Console.WriteLine($"Data de Início: {startDate:dd/MM/yyyy HH:mm}");
+            Console.WriteLine($"Deadline: {deadlineDate:dd/MM/yyyy HH:mm} (Minuto {deadlineMinutes})\n");
+
+
+            foreach (var product in products)
+            {
+                var finished = solver.Value(finishedByDeadlineVars[product.Name]);
+                var startedAfter = solver.Value(startedAfterDeadlineVars[product.Name]);
+                var firstOperation = operations.First();
+                var lastOperation = operations.Last();
+                var firstOpStartMin = (int)solver.Value(startVars[(product.Name, firstOperation.Name)]);
+                var lastOpEndMin = (int)solver.Value(endVars[(product.Name, lastOperation.Name)]);
+                var lastOpEndTime = startDate.AddMinutes(lastOpEndMin);
+
+                string productStatus;
+                if (finished == 1)
+                {
+                    productStatus = "FINALIZADO (dentro do deadline)";
+                    Console.WriteLine($"Produto {product.Name}: {productStatus}");
+                    Console.WriteLine($"  Lucro: {product.Price}");
+                    // Exibir detalhes das operações apenas para produtos finalizados dentro do prazo
+                    foreach (var operation in operations)
+                    {
+                        var startMin = (int)solver.Value(startVars[(product.Name, operation.Name)]);
+                        var endMin = (int)solver.Value(endVars[(product.Name, operation.Name)]);
+                        var startTime = startDate.AddMinutes(startMin);
+                        var endTime = startDate.AddMinutes(endMin);
+                        Console.WriteLine($"  {operation.Name}: Início em {startTime:dd/MM/yyyy HH:mm} (Minuto {startMin}), Fim em {endTime:dd/MM/yyyy HH:mm} (Minuto {endMin})");
+                    }
+                }
+                else if (startedAfter == 1)
+                {
+                    productStatus = "NÃO PLANEJADO (início após deadline)";
+                    Console.WriteLine($"Produto {product.Name}: {productStatus}");
+                    // Opcional: mostrar o tempo de início planejado, mesmo que seja após o deadline
+                    var firstOpStartTime = startDate.AddMinutes(firstOpStartMin);
+                    Console.WriteLine($"  Primeira operação planejada para iniciar em: {firstOpStartTime:dd/MM/yyyy HH:mm} (Minuto {firstOpStartMin})");
+                }
+                else // Começou antes ou no deadline, mas não terminou até o deadline
+                {
+                    productStatus = "CONCLUIDO APOS DEADLINE / PARCIALMENTE PLANEJADO";
+                    Console.WriteLine($"Produto {product.Name}: {productStatus}");
+                    var firstOpStartTime = startDate.AddMinutes(firstOpStartMin);
+                    Console.WriteLine($"  Primeira operação iniciada em: {firstOpStartTime:dd/MM/yyyy HH:mm} (Minuto {firstOpStartMin})");
+
+                    // Adiciona as informações de data real de conclusão e tempo de atraso
+                    Console.WriteLine($"  Data real de conclusão planejada: {lastOpEndTime:dd/MM/yyyy HH:mm} (Minuto {lastOpEndMin})");
+                    TimeSpan atraso = lastOpEndTime - deadlineDate;
+                    Console.WriteLine($"  Tempo de Atraso: {atraso.TotalMinutes} minutos ({atraso.Days} dias, {atraso.Hours} horas, {atraso.Minutes} minutos)");
+                }
+                Console.WriteLine(); // Linha em branco para separar produtos
+            }
+            Console.WriteLine($"Lucro total maximizado (considerando apenas produtos finalizados dentro do deadline): {solver.ObjectiveValue}");
+        }
+        else
+        {
+            Console.WriteLine("Nenhuma solução encontrada.");
+            Console.WriteLine($"Status do Solver: {status}");
+        }
+
+        Console.WriteLine("\nTeste do Solver concluído. Pressione Enter para sair.");
+        Console.ReadLine();
+    }
+}
+
+public class Product
+{
+    public string Name;
+    public int Quantity;
+    public int Price;
+
+    public Product(string name, int quantity, int price)
+    {
+        Name = name;
+        Quantity = quantity;
+        Price = price;
+    }
+}
+
+public class Operation
+{
+    public string Name;
+    public decimal Capacity; // Capacidade de produção por hora (tons/hora)
+    public int SetupTime; // Tempo de setup em minutos
+
+    public Operation(string name, decimal capacity, int setupTime)
+    {
+        Name = name;
+        Capacity = capacity;
+        SetupTime = setupTime;
+    }
+}
+
+public class WorkCenter
+{
+    public string Name;
+    public List<Operation> Operations; // Alterado para public para acesso
+
+    public WorkCenter(string name, List<Operation> operations)
+    {
+        Name = name;
+        Operations = operations;
+    }
+}
