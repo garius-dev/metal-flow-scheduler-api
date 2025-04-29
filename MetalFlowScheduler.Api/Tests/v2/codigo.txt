@@ -75,7 +75,14 @@ class Program
         // --- Dados de Entrada ---
         DateTime startDate = new DateTime(2025, 4, 29, 6, 0, 0);
         int planningHorizonMinutes = 100 * 60; // Horizonte aumentado um pouco
-        DateTime deadlineDate = new DateTime(2025, 5, 1, 16, 0, 0); // Deadline: 2 de Maio de 2025, 13:00
+
+        // --- FLAG DE CONTROLE DE ATRASO ---
+        bool permitirAtraso = false; // Defina como 'true' para permitir atrasos (início antes do deadline), 'false' para proibir qualquer atraso (fim antes do deadline)
+        // ------------------------------------
+
+        // Use um deadline mais apertado para testar a lógica de atraso
+        // DateTime deadlineDate = new DateTime(2025, 5, 1, 16, 0, 0); // Exemplo de deadline apertado
+        DateTime deadlineDate = new DateTime(2025, 5, 1, 16, 0, 0); // Deadline original
         int deadlineMinutes = (int)(deadlineDate - startDate).TotalMinutes;
 
         var products = new List<Product>
@@ -155,7 +162,6 @@ class Program
                 // Restrição: Produto só pode ser atribuído se permitido na linha
                 if (!line.AllowedProducts.Contains(productName))
                 {
-                    // CORRIGIDO: Força a BoolVar a ser falsa usando == 0
                     model.Add(assignmentVar == 0); // Proíbe diretamente a atribuição
                 }
 
@@ -416,28 +422,44 @@ class Program
             var finishedVar = finishedByDeadlineVars[productName];
             var startedAfterVar = startedAfterDeadlineVars[productName];
 
-            // Finalizado no prazo SE agendado E tempo de fim real <= deadline
-            model.Add(actualEndTime <= deadlineMinutes).OnlyEnforceIf(new ILiteral[] { finishedVar, isScheduledVar });
-            // Não finalizado no prazo SE agendado E tempo de fim real > deadline
-            model.Add(actualEndTime > deadlineMinutes).OnlyEnforceIf(new ILiteral[] { finishedVar.Not(), isScheduledVar });
+            // Define finishedVar: true se actualEndTime <= deadlineMinutes (mesmo se não agendado, será forçado a false depois)
+            model.Add(actualEndTime <= deadlineMinutes).OnlyEnforceIf(finishedVar);
+            model.Add(actualEndTime > deadlineMinutes).OnlyEnforceIf(finishedVar.Not());
 
-            // Usa AddImplication: Se não agendado => não finalizado
+            // Define startedAfterVar: true se actualStartTime > deadlineMinutes (mesmo se não agendado, será forçado a false depois)
+            model.Add(actualStartTime > deadlineMinutes).OnlyEnforceIf(startedAfterVar);
+            model.Add(actualStartTime <= deadlineMinutes).OnlyEnforceIf(startedAfterVar.Not());
+
+
+            // --- LÓGICA CONDICIONAL DA FLAG permitirAtraso ---
+            if (permitirAtraso)
+            {
+                // Se permitir atraso:
+                // Um produto só pode ser agendado (isScheduledVar=true) se NÃO começou APÓS o deadline (startedAfterVar=false).
+                // Ou seja, isScheduledVar => Not(startedAfterVar)
+                model.AddImplication(isScheduledVar, startedAfterVar.Not());
+            }
+            else
+            {
+                // Se NÃO permitir atraso:
+                // Um produto só pode ser agendado (isScheduledVar=true) se foi FINALIZADO DENTRO do deadline (finishedVar=true).
+                // Ou seja, isScheduledVar => finishedVar
+                model.AddImplication(isScheduledVar, finishedVar);
+            }
+            // ----------------------------------------------------
+
+            // Restrições adicionais para garantir consistência se não agendado:
+            // Se não agendado => não finalizado no prazo
             model.AddImplication(isScheduledVar.Not(), finishedVar.Not());
-
-
-            // Começou após deadline SE agendado E tempo de início real > deadline
-            model.Add(actualStartTime > deadlineMinutes).OnlyEnforceIf(new ILiteral[] { startedAfterVar, isScheduledVar });
-            // Não começou após deadline SE agendado E tempo de início real <= deadline
-            model.Add(actualStartTime <= deadlineMinutes).OnlyEnforceIf(new ILiteral[] { startedAfterVar.Not(), isScheduledVar });
-
-            // Usa AddImplication: Se não agendado => não começou após deadline
+            // Se não agendado => não começou após deadline
             model.AddImplication(isScheduledVar.Not(), startedAfterVar.Not());
 
         }
 
 
         // --- Função Objetivo ---
-        // Maximiza lucro dos produtos finalizados no prazo
+        // Maximiza lucro dos produtos finalizados no prazo (finishedByDeadlineVars)
+        // Esta parte não muda, pois o lucro só vem de produtos pontuais.
         LinearExpr objective = LinearExpr.Sum(products.Select(p => finishedByDeadlineVars[p.Name] * p.Price));
         model.Maximize(objective);
 
@@ -456,6 +478,7 @@ class Program
             Console.WriteLine($"Status do Solver: {status}");
             Console.WriteLine($"Data de Início do Planejamento: {startDate:dd/MM/yyyy HH:mm}");
             Console.WriteLine($"Deadline: {deadlineDate:dd/MM/yyyy HH:mm} (Minuto {deadlineMinutes})");
+            Console.WriteLine($"Permitir Atraso: {(permitirAtraso ? "SIM" : "NÃO")}"); // Mostra o status da flag
             Console.WriteLine($"Valor Objetivo (Lucro Máximo): {solver.ObjectiveValue}\n");
 
             // Ordena produtos para saída consistente (opcional)
@@ -463,7 +486,6 @@ class Program
 
             foreach (var product in sortedProducts)
             {
-
                 var productName = product.Name;
                 string assignedLineName = "Não Agendado";
                 // Usa SolverValue para checar resultados booleanos
@@ -489,8 +511,10 @@ class Program
                     // Usa SolverValue para variáveis de status, checando existência primeiro
                     bool finished = finishedByDeadlineVars.TryGetValue(productName, out var finVar) &&
                                     solver.Value(finVar) == 1;
-                    bool startedAfter = startedAfterDeadlineVars.TryGetValue(productName, out var startAfterVar) &&
-                                        solver.Value(startAfterVar) == 1;
+                    // 'startedAfter' não é mais diretamente necessário para determinar o status principal aqui,
+                    // mas pode ser útil para depuração ou informações adicionais se desejado.
+                    // bool startedAfter = startedAfterDeadlineVars.TryGetValue(productName, out var startAfterVar) &&
+                    //                     solver.Value(startAfterVar) == 1;
 
 
                     long firstOpStartMin = -1;
@@ -526,53 +550,63 @@ class Program
                     string productStatus;
                     Console.WriteLine($"Produto: {productName} (Atribuído à Linha: {assignedLineName})");
 
-                    if (finished)
+                    if (finished) // Se terminou no prazo, está finalizado.
                     {
                         productStatus = "FINALIZADO (dentro do deadline)";
                         Console.WriteLine($"  Status: {productStatus}");
                         Console.WriteLine($"  Lucro Contribuído: {product.Price}");
-                        // Exibe detalhes da operação para a linha atribuída
-                        var assignedLine = lines.First(l => l.Name == assignedLineName);
-                        foreach (var operation in assignedLine.GetAllOperationsInOrder())
-                        {
-                            // Verifica se chave existe antes de acessar valor do solver
-                            if (startVars.TryGetValue((productName, operation.Name, assignedLineName), out var startVar) &&
-                                endVars.TryGetValue((productName, operation.Name, assignedLineName), out var endVar))
-                            {
-                                var startMin = solver.Value(startVar);
-                                var endMin = solver.Value(endVar);
-                                var opStartTime = startDate.AddMinutes(startMin);
-                                var opEndTime = startDate.AddMinutes(endMin);
-                                Console.WriteLine($"    {operation.Name}: {opStartTime:dd/MM HH:mm} (Min {startMin}) -> {opEndTime:dd/MM HH:mm} (Min {endMin})");
-                            }
-                        }
                     }
-                    else if (startedAfter)
-                    {
-                        productStatus = "NÃO PLANEJADO (início após deadline)";
-                        Console.WriteLine($"  Status: {productStatus}");
-                        Console.WriteLine($"  Primeira operação planejada para iniciar em: {firstOpStartTime:dd/MM/yyyy HH:mm} (Minuto {firstOpStartMin})");
-                    }
-                    else // Começou a tempo, terminou tarde ou em andamento no deadline
+                    // Se está agendado (scheduled=true) mas não terminou no prazo (finished=false),
+                    // e a flag permitirAtraso era true, então ele foi concluído com atraso.
+                    // Se permitirAtraso fosse false, ele não teria sido agendado (scheduled seria false).
+                    else
                     {
                         productStatus = "CONCLUIDO APOS DEADLINE / PARCIALMENTE PLANEJADO";
                         Console.WriteLine($"  Status: {productStatus}");
-                        Console.WriteLine($"  Primeira operação iniciada em: {firstOpStartTime:dd/MM/yyyy HH:mm} (Minuto {firstOpStartMin})");
-                        Console.WriteLine($"  Data real de conclusão planejada: {lastOpEndTime:dd/MM/yyyy HH:mm} (Minuto {lastOpEndMin})");
-                        if (lastOpEndMin > deadlineMinutes && lastOpEndMin >= 0 && firstOpStartMin >= 0) // Garante tempos válidos antes de calcular atraso
+                        // Não contribui para o lucro do objetivo.
+                    }
+
+                    // Exibe detalhes das operações e tempos
+                    Console.WriteLine($"  Primeira operação iniciada em: {firstOpStartTime:dd/MM/yyyy HH:mm} (Minuto {firstOpStartMin})");
+                    Console.WriteLine($"  Data real de conclusão planejada: {lastOpEndTime:dd/MM/yyyy HH:mm} (Minuto {lastOpEndMin})");
+
+                    // Mostra detalhes das operações individuais
+                    var assignedLineDetails = lines.First(l => l.Name == assignedLineName);
+                    foreach (var operation in assignedLineDetails.GetAllOperationsInOrder())
+                    {
+                        if (startVars.TryGetValue((productName, operation.Name, assignedLineName), out var startVar) &&
+                            endVars.TryGetValue((productName, operation.Name, assignedLineName), out var endVar))
                         {
-                            TimeSpan atraso = lastOpEndTime - deadlineDate;
-                            if (atraso.TotalMinutes > 0) // Mostra apenas atraso positivo
-                            {
-                                Console.WriteLine($"  Tempo de Atraso: {atraso.TotalMinutes} minutos ({atraso.Days}d {atraso.Hours}h {atraso.Minutes}m)");
-                            }
+                            var startMin = solver.Value(startVar);
+                            var endMin = solver.Value(endVar);
+                            var opStartTime = startDate.AddMinutes(startMin);
+                            var opEndTime = startDate.AddMinutes(endMin);
+                            Console.WriteLine($"    {operation.Name}: {opStartTime:dd/MM HH:mm} (Min {startMin}) -> {opEndTime:dd/MM HH:mm} (Min {endMin})");
+                        }
+                    }
+
+                    // Calcula e mostra o atraso se houver
+                    if (!finished && lastOpEndMin >= 0 && firstOpStartMin >= 0) // Apenas se terminou após deadline e tempos são válidos
+                    {
+                        TimeSpan atraso = lastOpEndTime - deadlineDate;
+                        if (atraso.TotalMinutes > 0) // Mostra apenas atraso positivo
+                        {
+                            Console.WriteLine($"  Tempo de Atraso: {atraso.TotalMinutes} minutos ({atraso.Days}d {atraso.Hours}h {atraso.Minutes}m)");
                         }
                     }
                 }
-                else
+                else // Se scheduled == false
                 {
                     Console.WriteLine($"Produto: {productName}");
-                    Console.WriteLine($"  Status: NÃO AGENDADO (Não lucrativo ou impossível de alocar/finalizar a tempo)");
+                    // Ajusta a mensagem dependendo da flag
+                    if (!permitirAtraso)
+                    {
+                        Console.WriteLine($"  Status: NÃO AGENDADO (Terminaria após deadline ou não lucrativo)");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"  Status: NÃO AGENDADO (Começaria após deadline ou não lucrativo)");
+                    }
                 }
                 Console.WriteLine(); // Linha em branco entre produtos
             }
