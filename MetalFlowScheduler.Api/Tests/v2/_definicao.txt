@@ -1,3 +1,3 @@
 ﻿- adicionado logica de processamento de linhas em paralelo
 - adicionado a logica de escolher qual produto roda em qual linha
-- adicionado flag de permitir atraso **APENAS FLAG TRUE FUNCIONA**
+- adicionado flag de permitir atraso (se true agenda o ultimo atrasado, se não exclui do planejamento)

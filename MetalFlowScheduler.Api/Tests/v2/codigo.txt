@@ -22,8 +22,6 @@ public class Product
 public class Operation
 {
     public string Name { get; }
-    // Capacidade e Tempo de Setup podem ser específicos da operação dentro de um WorkCenter/Linha,
-    // mas por simplicidade, mantemos aqui e assumimos que são os mesmos entre linhas por enquanto.
     public decimal Capacity { get; } // Capacidade de produção por hora
     public int SetupTime { get; }   // Tempo de setup em minutos ao trocar produtos
 
@@ -77,69 +75,59 @@ class Program
         int planningHorizonMinutes = 100 * 60; // Horizonte aumentado um pouco
 
         // --- FLAG DE CONTROLE DE ATRASO ---
-        bool permitirAtraso = false; // Defina como 'true' para permitir atrasos (início antes do deadline), 'false' para proibir qualquer atraso (fim antes do deadline)
+        // Defina como 'true' para permitir atrasos (início antes/no deadline),
+        // 'false' para proibir qualquer atraso (fim antes/no deadline)
+        bool permitirAtraso = false;
         // ------------------------------------
 
         // Use um deadline mais apertado para testar a lógica de atraso
-        // DateTime deadlineDate = new DateTime(2025, 5, 1, 16, 0, 0); // Exemplo de deadline apertado
-        DateTime deadlineDate = new DateTime(2025, 5, 1, 16, 0, 0); // Deadline original
+        DateTime deadlineDate = new DateTime(2025, 5, 1, 16, 0, 0); // Exemplo de deadline apertado (Minuto 3480)
+        // DateTime deadlineDate = new DateTime(2025, 5, 2, 13, 0, 0); // Deadline original (Minuto 4740)
         int deadlineMinutes = (int)(deadlineDate - startDate).TotalMinutes;
 
         var products = new List<Product>
         {
-            new Product("VAT30", 100, 50),
-            new Product("VD500", 100, 60),
-            new Product("SX650", 100, 70),
-            new Product("NEWPROD", 50, 80) // Produto novo adicionado
+            new Product("VAT30", 100, 50), // Duration ~1200 min
+            new Product("VD500", 100, 60), // Duration ~1800 min
+            new Product("SX650", 100, 70), // Duration ~2400 min
+            new Product("NEWPROD", 50, 80) // Duration ~1200 min
         };
 
-        // Define as operações base (assumindo propriedades iguais entre linhas por agora)
+        // Define as operações base
         var fusaoOp = new Operation("Fusao", 10M, 15);
         var aquecimentoOp = new Operation("Aquecimento", 10M, 15);
         var extrusaoOp = new Operation("Extrusao", 10M, 15);
         var corteOp = new Operation("Corte", 10M, 15);
 
-        // Define WorkCenters (estrutura pode ser reutilizada ou única por linha)
+        // Define WorkCenters
         var wcSet1 = new List<WorkCenter>
         {
             new WorkCenter("Aciaria", new List<Operation> { fusaoOp, aquecimentoOp }),
             new WorkCenter("Laminacao", new List<Operation> { extrusaoOp, corteOp })
         };
-        // Exemplo: Um segundo conjunto de WorkCenters para outra linha
         var wcSet2 = new List<WorkCenter>
         {
-             // Podem ser WCs diferentes ou mesma estrutura com nomes diferentes se necessário
             new WorkCenter("Aciaria_L2", new List<Operation> { fusaoOp, aquecimentoOp }),
             new WorkCenter("Laminacao_L2", new List<Operation> { extrusaoOp, corteOp })
         };
 
-
-        // Define Linhas com seus WorkCenters e produtos permitidos
+        // Define Linhas
         var lines = new List<Line>
         {
-            // Linha 1 pode processar todos os produtos originais
             new Line("Predio 01", wcSet1, new[] { "VAT30", "VD500", "SX650" }),
-            // Linha 2 pode processar VAT30 e o produto novo
             new Line("Predio 02", wcSet2, new[] { "NEWPROD" })
         };
 
         var model = new CpModel();
 
         // --- Variáveis de Decisão ---
-
-        // assignProdToLine[p, l]: Verdadeiro se produto p é atribuído à linha l
-        var assignProdToLine = new Dictionary<(string productName, string lineName), BoolVar>();
-
-        // Variáveis de intervalo por produto, operação, *e* linha
-        // Como operações são dedicadas por linha, o tempo depende da atribuição à linha.
-        var intervalVars = new Dictionary<(string productName, string opName, string lineName), IntervalVar>();
-        var startVars = new Dictionary<(string productName, string opName, string lineName), IntVar>();
-        var endVars = new Dictionary<(string productName, string opName, string lineName), IntVar>();
-
-        // Variáveis de status por produto (status geral, independente da linha)
-        var finishedByDeadlineVars = new Dictionary<string, BoolVar>();
-        var startedAfterDeadlineVars = new Dictionary<string, BoolVar>();
-        var productIsScheduled = new Dictionary<string, BoolVar>(); // Indica se produto é agendado em *qualquer* linha
+        var assignProdToLine = new Dictionary<(string, string), BoolVar>();
+        var intervalVars = new Dictionary<(string, string, string), IntervalVar>();
+        var startVars = new Dictionary<(string, string, string), IntVar>();
+        var endVars = new Dictionary<(string, string, string), IntVar>();
+        var finishedByDeadlineVars = new Dictionary<string, BoolVar>(); // Usado no objetivo e lógica
+        var startedAfterDeadlineVars = new Dictionary<string, BoolVar>(); // Usado na lógica da flag
+        var productIsScheduled = new Dictionary<string, BoolVar>();
 
 
         // Cria variáveis
@@ -155,106 +143,92 @@ class Program
             foreach (var line in lines)
             {
                 var lineName = line.Name;
-                var assignmentVar = model.NewBoolVar($"Assign_{productName}_To_{lineName}");
-                assignProdToLine[(productName, lineName)] = assignmentVar;
-                possibleLinesForProduct.Add(assignmentVar);
-
-                // Restrição: Produto só pode ser atribuído se permitido na linha
-                if (!line.AllowedProducts.Contains(productName))
+                if (line.AllowedProducts.Contains(productName))
                 {
-                    model.Add(assignmentVar == 0); // Proíbe diretamente a atribuição
-                }
+                    var assignmentVar = model.NewBoolVar($"Assign_{productName}_To_{lineName}");
+                    assignProdToLine[(productName, lineName)] = assignmentVar;
+                    possibleLinesForProduct.Add(assignmentVar);
 
-                // Cria variáveis de tempo de operação *para esta linha específica*
-                var lineOperations = line.GetAllOperationsInOrder();
-                foreach (var operation in lineOperations)
-                {
-                    var opName = operation.Name;
-                    // Calcula duração (mesma lógica anterior, pode ser específica linha/op se necessário)
-                    long duration = Math.Max(1, (long)Math.Ceiling(product.Quantity / operation.Capacity * 60M));
+                    var lineOperations = line.GetAllOperationsInOrder();
+                    if (!lineOperations.Any()) continue; // Pula linha sem operações
 
-                    // Variáveis são definidas, mas só significativas se o produto for atribuído a esta linha
-                    var start = model.NewIntVar(0, planningHorizonMinutes, $"Start_{productName}_{opName}_{lineName}");
-                    var end = model.NewIntVar(0, planningHorizonMinutes, $"End_{productName}_{opName}_{lineName}");
-                    // Variável de intervalo é criada, mas suas restrições serão condicionais
-                    var interval = model.NewIntervalVar(start, duration, end, $"Interval_{productName}_{opName}_{lineName}");
+                    foreach (var operation in lineOperations)
+                    {
+                        var opName = operation.Name;
+                        long duration = Math.Max(1, (long)Math.Ceiling(product.Quantity / operation.Capacity * 60M));
+                        var start = model.NewIntVar(0, planningHorizonMinutes, $"Start_{productName}_{opName}_{lineName}");
+                        var end = model.NewIntVar(0, planningHorizonMinutes, $"End_{productName}_{opName}_{lineName}");
+                        var interval = model.NewIntervalVar(start, duration, end, $"Interval_{productName}_{opName}_{lineName}");
 
-                    startVars[(productName, opName, lineName)] = start;
-                    endVars[(productName, opName, lineName)] = end;
-                    intervalVars[(productName, opName, lineName)] = interval;
+                        startVars[(productName, opName, lineName)] = start;
+                        endVars[(productName, opName, lineName)] = end;
+                        intervalVars[(productName, opName, lineName)] = interval;
 
-                    // Restrição: Liga duração do intervalo à atribuição
-                    model.Add(end == start + duration).OnlyEnforceIf(assignmentVar);
-                    // Deixa o solver lidar com intervalos não atribuídos (não participarão das restrições abaixo).
-
+                        model.Add(end == start + duration).OnlyEnforceIf(assignmentVar);
+                    }
                 }
             }
-            // Restrição: Cada produto deve ser atribuído a exatamente uma linha SE for agendado
-            model.Add(LinearExpr.Sum(possibleLinesForProduct) == 1).OnlyEnforceIf(productIsScheduled[productName]);
-            model.Add(LinearExpr.Sum(possibleLinesForProduct) == 0).OnlyEnforceIf(productIsScheduled[productName].Not());
 
+            if (possibleLinesForProduct.Any())
+            {
+                model.Add(LinearExpr.Sum(possibleLinesForProduct) == 1).OnlyEnforceIf(productIsScheduled[productName]);
+                model.Add(LinearExpr.Sum(possibleLinesForProduct) == 0).OnlyEnforceIf(productIsScheduled[productName].Not());
+            }
+            else
+            {
+                model.Add(productIsScheduled[productName] == 0);
+            }
         }
 
-        // --- Restrições ---
-
+        // --- Restrições (Sequência, NoOverlap, Setup, Bloqueio WC) ---
+        // (Mantidas como na v15 - sem alterações nesta seção)
         foreach (var line in lines)
         {
             var lineName = line.Name;
             var lineOperations = line.GetAllOperationsInOrder();
             var productsAllowedOnLine = products.Where(p => line.AllowedProducts.Contains(p.Name)).ToList();
 
-            // 1. Sequência de Operações (dentro de um produto, dentro desta linha)
+            // 1. Sequência de Operações
             foreach (var product in productsAllowedOnLine)
             {
                 var productName = product.Name;
-                var assignmentVar = assignProdToLine[(productName, lineName)];
-
-                for (int i = 0; i < lineOperations.Count - 1; i++)
+                if (assignProdToLine.TryGetValue((productName, lineName), out var assignmentVar))
                 {
-                    var op1 = lineOperations[i];
-                    var op2 = lineOperations[i + 1];
-                    // Restrição só se aplica se o produto for atribuído a esta linha
-                    // Verifica se as chaves existem antes de adicionar a restrição
-                    if (startVars.ContainsKey((productName, op2.Name, lineName)) && endVars.ContainsKey((productName, op1.Name, lineName)))
+                    for (int i = 0; i < lineOperations.Count - 1; i++)
                     {
-                        model.Add(startVars[(productName, op2.Name, lineName)] >= endVars[(productName, op1.Name, lineName)])
-                             .OnlyEnforceIf(assignmentVar);
+                        var op1 = lineOperations[i];
+                        var op2 = lineOperations[i + 1];
+                        if (startVars.ContainsKey((productName, op2.Name, lineName)) && endVars.ContainsKey((productName, op1.Name, lineName)))
+                        {
+                            model.Add(startVars[(productName, op2.Name, lineName)] >= endVars[(productName, op1.Name, lineName)])
+                                 .OnlyEnforceIf(assignmentVar);
+                        }
                     }
                 }
             }
 
-            // 2. Não Sobreposição de Operação & Tempos de Setup (dentro desta linha)
-            foreach (var operation in lineOperations) // Itera sobre cada operação definida para esta linha
+            // 2. Não Sobreposição e Setup
+            foreach (var operation in lineOperations)
             {
                 var opName = operation.Name;
                 var intervalsForOpOnLine = new List<IntervalVar>();
-
-                // Coleta intervalos para esta operação específica nesta linha específica
                 foreach (var product in productsAllowedOnLine)
                 {
                     var productName = product.Name;
-                    // Verifica se a chave existe antes de acessar
-                    if (intervalVars.ContainsKey((productName, opName, lineName)))
+                    if (intervalVars.ContainsKey((productName, opName, lineName)) &&
+                        assignProdToLine.TryGetValue((productName, lineName), out var assignmentVar))
                     {
                         var start = startVars[(productName, opName, lineName)];
                         var end = endVars[(productName, opName, lineName)];
                         long duration = Math.Max(1, (long)Math.Ceiling(product.Quantity / operation.Capacity * 60M));
-                        var assignmentVar = assignProdToLine[(productName, lineName)];
-
-                        // Cria uma variável de intervalo *opcional* que existe apenas se o produto for atribuído a esta linha
                         var optInterval = model.NewOptionalIntervalVar(start, duration, end, assignmentVar, $"OptInterval_{productName}_{opName}_{lineName}");
-                        intervalsForOpOnLine.Add(optInterval); // Adiciona o intervalo opcional à lista para NoOverlap
+                        intervalsForOpOnLine.Add(optInterval);
                     }
                 }
-
-                // Aplica restrição NoOverlap aos intervalos *relevantes para esta operação nesta linha*
                 if (intervalsForOpOnLine.Count > 1)
                 {
                     model.AddNoOverlap(intervalsForOpOnLine);
                 }
-
-
-                // Aplica Tempos de Setup (entre produtos diferentes na mesma operação na mesma linha)
                 for (int i = 0; i < productsAllowedOnLine.Count; i++)
                 {
                     for (int j = i + 1; j < productsAllowedOnLine.Count; j++)
@@ -263,87 +237,50 @@ class Program
                         var prod2 = productsAllowedOnLine[j];
                         var p1Name = prod1.Name;
                         var p2Name = prod2.Name;
-
-                        // Verifica se variáveis existem para ambos os produtos para esta operação/linha
                         if (!startVars.ContainsKey((p1Name, opName, lineName)) || !startVars.ContainsKey((p2Name, opName, lineName))) continue;
-
+                        if (!assignProdToLine.TryGetValue((p1Name, lineName), out var assign1) ||
+                            !assignProdToLine.TryGetValue((p2Name, lineName), out var assign2)) continue;
                         var start1 = startVars[(p1Name, opName, lineName)];
                         var end1 = endVars[(p1Name, opName, lineName)];
                         var start2 = startVars[(p2Name, opName, lineName)];
                         var end2 = endVars[(p2Name, opName, lineName)];
-
-                        var assign1 = assignProdToLine[(p1Name, lineName)];
-                        var assign2 = assignProdToLine[(p2Name, lineName)];
-
-                        // Variável booleana indicando se prod1 vem antes de prod2 para esta op nesta linha
                         var p1BeforeP2OpLine = model.NewBoolVar($"P1BeforeP2_{p1Name}_{p2Name}_{opName}_{lineName}");
-
                         long transitionTime = operation.SetupTime;
-
-                        // Restrição de setup se p1 -> p2 nesta op/linha
-                        // Aplica somente se ambos produtos estão atribuídos a esta linha E p1 é escolhido para vir antes de p2
                         model.Add(start2 >= end1 + transitionTime).OnlyEnforceIf(new[] { p1BeforeP2OpLine, assign1, assign2 });
-
-                        // Restrição de setup se p2 -> p1 nesta op/linha
-                        // Aplica somente se ambos produtos estão atribuídos a esta linha E p1 NÃO é escolhido para vir antes de p2 (significa p2 vem antes)
                         model.Add(start1 >= end2 + transitionTime).OnlyEnforceIf(new[] { p1BeforeP2OpLine.Not(), assign1, assign2 });
-
-                        // AddNoOverlap implicitamente lida que *alguma* ordem deve existir se ambos assign1 e assign2 são verdadeiros.
-                        // Só precisamos ligar nossas restrições de tempo de setup a essa ordem implícita via p1BeforeP2OpLine.
                     }
                 }
             }
 
-
-            // 3. Sequência de WorkCenter & Bloqueio (dentro desta linha)
+            // 3. Bloqueio WC
             var lineWorkCenters = line.WorkCenters;
             for (int wcIdx = 0; wcIdx < lineWorkCenters.Count - 1; wcIdx++)
             {
                 var wc1 = lineWorkCenters[wcIdx];
                 var wc2 = lineWorkCenters[wcIdx + 1];
-
-                // Garante que WorkCenters têm operações antes de prosseguir
                 if (!wc1.Operations.Any() || !wc2.Operations.Any()) continue;
-
                 var lastOpWC1 = wc1.Operations.Last();
                 var firstOpWC2 = wc2.Operations.First();
-
-                // Compara cada par de produtos permitidos nesta linha
                 for (int i = 0; i < productsAllowedOnLine.Count; i++)
                 {
                     var prod1 = productsAllowedOnLine[i];
                     var p1Name = prod1.Name;
-                    var assign1 = assignProdToLine[(p1Name, lineName)];
-
-                    // Verifica se variáveis existem (robustez para estruturas de WC potencialmente diferentes)
                     if (!endVars.ContainsKey((p1Name, lastOpWC1.Name, lineName)) || !startVars.ContainsKey((p1Name, firstOpWC2.Name, lineName))) continue;
-
+                    if (!assignProdToLine.TryGetValue((p1Name, lineName), out var assign1)) continue;
                     for (int j = i + 1; j < productsAllowedOnLine.Count; j++)
                     {
                         var prod2 = productsAllowedOnLine[j];
                         var p2Name = prod2.Name;
-                        var assign2 = assignProdToLine[(p2Name, lineName)];
-
-                        // Verifica se variáveis existem para produto 2 também
                         if (!endVars.ContainsKey((p2Name, lastOpWC1.Name, lineName)) || !startVars.ContainsKey((p2Name, firstOpWC2.Name, lineName))) continue;
-
-                        // Lógica de bloqueio baseada na ordem de conclusão no WC1
+                        if (!assignProdToLine.TryGetValue((p2Name, lineName), out var assign2)) continue;
                         var p1FinishesWC1LastOpBeforeP2 = model.NewBoolVar($"P1FinWC1BeforeP2_{p1Name}_{p2Name}_{wc1.Name}_{lineName}");
-
                         var end1WC1 = endVars[(p1Name, lastOpWC1.Name, lineName)];
                         var end2WC1 = endVars[(p2Name, lastOpWC1.Name, lineName)];
                         var start1WC2 = startVars[(p1Name, firstOpWC2.Name, lineName)];
                         var start2WC2 = startVars[(p2Name, firstOpWC2.Name, lineName)];
-
-                        // Define a variável de ordem baseada nos tempos de fim da última op no WC1
-                        // Essas restrições só importam se ambos produtos estão atribuídos à linha.
                         model.Add(end1WC1 <= end2WC1).OnlyEnforceIf(new ILiteral[] { p1FinishesWC1LastOpBeforeP2, assign1, assign2 });
                         model.Add(end1WC1 > end2WC1).OnlyEnforceIf(new ILiteral[] { p1FinishesWC1LastOpBeforeP2.Not(), assign1, assign2 });
-
-                        // Aplica restrição de bloqueio: Se p1 termina a última op do WC1 primeiro, p2 só pode começar WC2 após p1 terminar a última op do WC1.
                         model.Add(start2WC2 >= end1WC1).OnlyEnforceIf(new ILiteral[] { p1FinishesWC1LastOpBeforeP2, assign1, assign2 });
-
-                        // Aplica restrição de bloqueio: Se p2 termina a última op do WC1 primeiro, p1 só pode começar WC2 após p2 terminar a última op do WC1.
                         model.Add(start1WC2 >= end2WC1).OnlyEnforceIf(new ILiteral[] { p1FinishesWC1LastOpBeforeP2.Not(), assign1, assign2 });
                     }
                 }
@@ -351,122 +288,118 @@ class Program
         }
 
 
-        // 4. Restrições de Deadline (ligando tempos específicos da linha ao status geral do produto)
+        // 4. Restrições de Deadline e Definição de Variáveis de Status
         foreach (var product in products)
         {
             var productName = product.Name;
-            var isScheduledVar = productIsScheduled[productName]; // Usa a variável indicando se está agendado
+            var isScheduledVar = productIsScheduled[productName];
+            var finishedVar = finishedByDeadlineVars[productName];
+            var startedAfterVar = startedAfterDeadlineVars[productName];
 
-            // Obtém nomes da primeira/última operação dinamicamente baseado nas linhas que o produto *pode* rodar
             string firstOpName = null;
             string lastOpName = null;
-            bool productHasValidLineVars = false; // Rastreia se vars existem para este produto em qualquer linha permitida
+            bool productHasValidTimeVars = false;
+            List<Line> possibleProductLines = lines.Where(l => l.AllowedProducts.Contains(productName)).ToList();
 
-            foreach (var line in lines.Where(l => l.AllowedProducts.Contains(productName)))
+            // Verifica se existe alguma linha válida e obtém nomes das ops
+            foreach (var line in possibleProductLines)
             {
                 var currentLineOps = line.GetAllOperationsInOrder();
-                if (!currentLineOps.Any()) continue; // Pula linhas sem ops
-
+                if (!currentLineOps.Any()) continue;
                 var currentFirstOpName = currentLineOps.First().Name;
                 var currentLastOpName = currentLineOps.Last().Name;
-
-                // Verifica se vars existem para as ops desta linha específica
                 if (startVars.ContainsKey((productName, currentFirstOpName, line.Name)) &&
                     endVars.ContainsKey((productName, currentLastOpName, line.Name)))
                 {
-                    productHasValidLineVars = true;
-                    // Atribui nomes da primeira/última op (assumindo consistência entre linhas válidas para este produto)
-                    // Se nomes pudessem diferir significativamente, esta lógica precisa de mais refinamento.
+                    productHasValidTimeVars = true;
                     if (firstOpName == null) firstOpName = currentFirstOpName;
                     if (lastOpName == null) lastOpName = currentLastOpName;
                 }
             }
 
-            // Se produto não pode rodar em nenhuma linha ou nenhuma variável foi criada, pula restrições de deadline para ele
-            if (!productHasValidLineVars)
+            if (!productHasValidTimeVars)
             {
-                model.Add(isScheduledVar == 0); // Força não agendado
-                continue; // Pula para próximo produto
+                continue;
             }
 
-
-            // Variáveis intermediárias para o tempo real de início/fim *se agendado*
+            // Variáveis intermediárias (necessárias para definir finishedVar/startedAfterVar)
             var actualStartTime = model.NewIntVar(0, planningHorizonMinutes, $"ActualStart_{productName}");
             var actualEndTime = model.NewIntVar(0, planningHorizonMinutes, $"ActualEnd_{productName}");
 
-            // Liga tempos reais aos tempos específicos da linha baseado na atribuição
-            foreach (var line in lines.Where(l => l.AllowedProducts.Contains(productName))) // Itera apenas linhas permitidas
+            // Liga tempos reais
+            foreach (var line in possibleProductLines)
             {
                 var lineName = line.Name;
-                var currentLineOps = line.GetAllOperationsInOrder();
-                if (!currentLineOps.Any()) continue;
-                var currentFirstOpName = currentLineOps.First().Name; // Usa nomes de op específicos da linha
-                var currentLastOpName = currentLineOps.Last().Name;
-
-                // Verifica novamente se vars existem para esta linha específica antes de adicionar restrição
-                if (startVars.ContainsKey((productName, currentFirstOpName, lineName)) &&
-                    endVars.ContainsKey((productName, currentLastOpName, lineName)))
+                if (startVars.ContainsKey((productName, firstOpName, lineName)) &&
+                    endVars.ContainsKey((productName, lastOpName, lineName)) &&
+                    assignProdToLine.TryGetValue((productName, lineName), out var assignmentVar))
                 {
-                    var assignmentVar = assignProdToLine[(productName, lineName)];
-                    model.Add(actualStartTime == startVars[(productName, currentFirstOpName, lineName)]).OnlyEnforceIf(assignmentVar);
-                    model.Add(actualEndTime == endVars[(productName, currentLastOpName, lineName)]).OnlyEnforceIf(assignmentVar);
+                    model.Add(actualStartTime == startVars[(productName, firstOpName, lineName)]).OnlyEnforceIf(assignmentVar);
+                    model.Add(actualEndTime == endVars[(productName, lastOpName, lineName)]).OnlyEnforceIf(assignmentVar);
                 }
             }
 
-            // Se o produto não está agendado, define tempos reais para 0.
+            // Define tempos se não agendado
             model.Add(actualStartTime == 0).OnlyEnforceIf(isScheduledVar.Not());
             model.Add(actualEndTime == 0).OnlyEnforceIf(isScheduledVar.Not());
 
+            // Define finishedVar e startedAfterVar (baseado nos tempos reais)
+            // Usando a definição robusta da v15
+            var endTimeLEDeadlineVar = model.NewBoolVar($"EndTimeLEDeadline_{productName}");
+            model.Add(actualEndTime <= deadlineMinutes).OnlyEnforceIf(endTimeLEDeadlineVar);
+            model.Add(actualEndTime > deadlineMinutes).OnlyEnforceIf(endTimeLEDeadlineVar.Not());
+            model.AddBoolAnd(new ILiteral[] { isScheduledVar, endTimeLEDeadlineVar }).OnlyEnforceIf(finishedVar);
+            model.AddImplication(isScheduledVar.Not(), finishedVar.Not());
+            model.AddImplication(endTimeLEDeadlineVar.Not(), finishedVar.Not());
 
-            // Define status baseado nos tempos reais e deadline
-            var finishedVar = finishedByDeadlineVars[productName];
-            var startedAfterVar = startedAfterDeadlineVars[productName];
-
-            // Define finishedVar: true se actualEndTime <= deadlineMinutes (mesmo se não agendado, será forçado a false depois)
-            model.Add(actualEndTime <= deadlineMinutes).OnlyEnforceIf(finishedVar);
-            model.Add(actualEndTime > deadlineMinutes).OnlyEnforceIf(finishedVar.Not());
-
-            // Define startedAfterVar: true se actualStartTime > deadlineMinutes (mesmo se não agendado, será forçado a false depois)
-            model.Add(actualStartTime > deadlineMinutes).OnlyEnforceIf(startedAfterVar);
-            model.Add(actualStartTime <= deadlineMinutes).OnlyEnforceIf(startedAfterVar.Not());
+            var startTimeGTDeadlineVar = model.NewBoolVar($"StartTimeGTDeadline_{productName}");
+            model.Add(actualStartTime > deadlineMinutes).OnlyEnforceIf(startTimeGTDeadlineVar);
+            model.Add(actualStartTime <= deadlineMinutes).OnlyEnforceIf(startTimeGTDeadlineVar.Not());
+            model.AddBoolAnd(new ILiteral[] { isScheduledVar, startTimeGTDeadlineVar }).OnlyEnforceIf(startedAfterVar);
+            model.AddImplication(isScheduledVar.Not(), startedAfterVar.Not());
+            model.AddImplication(startTimeGTDeadlineVar.Not(), startedAfterVar.Not());
 
 
-            // --- LÓGICA CONDICIONAL DA FLAG permitirAtraso ---
+            // --- LÓGICA CONDICIONAL DA FLAG --- REVISADA v16 ---
             if (permitirAtraso)
             {
-                // Se permitir atraso:
-                // Um produto só pode ser agendado (isScheduledVar=true) se NÃO começou APÓS o deadline (startedAfterVar=false).
-                // Ou seja, isScheduledVar => Not(startedAfterVar)
+                // Se permitir atraso: Se agendado, não pode ter começado APÓS o deadline.
                 model.AddImplication(isScheduledVar, startedAfterVar.Not());
             }
             else
             {
-                // Se NÃO permitir atraso:
-                // Um produto só pode ser agendado (isScheduledVar=true) se foi FINALIZADO DENTRO do deadline (finishedVar=true).
-                // Ou seja, isScheduledVar => finishedVar
-                model.AddImplication(isScheduledVar, finishedVar);
-            }
-            // ----------------------------------------------------
+                // Se NÃO permitir atraso: Para cada linha possível, se atribuído a ela, deve terminar no prazo.
+                foreach (var line in possibleProductLines)
+                {
+                    var lineName = line.Name;
+                    var lineOps = line.GetAllOperationsInOrder();
+                    if (!lineOps.Any()) continue;
+                    var currentLastOpName = lineOps.Last().Name; // Precisa do nome da última op *desta* linha
 
-            // Restrições adicionais para garantir consistência se não agendado:
-            // Se não agendado => não finalizado no prazo
-            model.AddImplication(isScheduledVar.Not(), finishedVar.Not());
-            // Se não agendado => não começou após deadline
-            model.AddImplication(isScheduledVar.Not(), startedAfterVar.Not());
+                    // Verifica se as variáveis existem para esta linha específica
+                    if (endVars.ContainsKey((productName, currentLastOpName, lineName)) &&
+                        assignProdToLine.TryGetValue((productName, lineName), out var assignmentVar))
+                    {
+                        // Se atribuído a esta linha, o tempo final DESTA LINHA deve ser <= deadline
+                        model.Add(endVars[(productName, currentLastOpName, lineName)] <= deadlineMinutes)
+                             .OnlyEnforceIf(assignmentVar);
+                    }
+                }
+            }
+            // --- FIM DA LÓGICA CONDICIONAL ---
 
         }
 
 
         // --- Função Objetivo ---
-        // Maximiza lucro dos produtos finalizados no prazo (finishedByDeadlineVars)
-        // Esta parte não muda, pois o lucro só vem de produtos pontuais.
+        // Objetivo ÚNICO: Maximiza lucro dos produtos finalizados no prazo (finishedByDeadlineVars)
         LinearExpr objective = LinearExpr.Sum(products.Select(p => finishedByDeadlineVars[p.Name] * p.Price));
         model.Maximize(objective);
 
 
         // --- Resolve ---
         var solver = new CpSolver();
-        solver.StringParameters = "max_time_in_seconds:30.0; log_search_progress: true;";
+        solver.StringParameters = "max_time_in_seconds:60.0; log_search_progress: true;";
         Console.WriteLine("Iniciando solver...");
         var status = solver.Solve(model);
         Console.WriteLine("Solver finalizado.");
@@ -479,27 +412,21 @@ class Program
             Console.WriteLine($"Data de Início do Planejamento: {startDate:dd/MM/yyyy HH:mm}");
             Console.WriteLine($"Deadline: {deadlineDate:dd/MM/yyyy HH:mm} (Minuto {deadlineMinutes})");
             Console.WriteLine($"Permitir Atraso: {(permitirAtraso ? "SIM" : "NÃO")}"); // Mostra o status da flag
-            Console.WriteLine($"Valor Objetivo (Lucro Máximo): {solver.ObjectiveValue}\n");
+            Console.WriteLine($"Valor Objetivo (Lucro Máximo): {solver.ObjectiveValue}\n"); // Lucro real dos pontuais
 
-            // Ordena produtos para saída consistente (opcional)
             var sortedProducts = products.OrderBy(p => p.Name);
 
             foreach (var product in sortedProducts)
             {
                 var productName = product.Name;
                 string assignedLineName = "Não Agendado";
-                // Usa SolverValue para checar resultados booleanos
-                // Verifica se variável productIsScheduled existe antes de acessar seu valor
                 bool scheduled = productIsScheduled.TryGetValue(productName, out var scheduledVar) &&
                                  solver.Value(scheduledVar) == 1;
 
-
                 if (scheduled)
                 {
-                    // Encontra a linha atribuída
                     foreach (var line in lines)
                     {
-                        // Verifica se a variável de atribuição existe e seu valor é 1
                         if (assignProdToLine.TryGetValue((productName, line.Name), out var assignVar) &&
                             solver.Value(assignVar) == 1)
                         {
@@ -508,18 +435,25 @@ class Program
                         }
                     }
 
-                    // Usa SolverValue para variáveis de status, checando existência primeiro
-                    bool finished = finishedByDeadlineVars.TryGetValue(productName, out var finVar) &&
-                                    solver.Value(finVar) == 1;
-                    // 'startedAfter' não é mais diretamente necessário para determinar o status principal aqui,
-                    // mas pode ser útil para depuração ou informações adicionais se desejado.
-                    // bool startedAfter = startedAfterDeadlineVars.TryGetValue(productName, out var startAfterVar) &&
-                    //                     solver.Value(startAfterVar) == 1;
-
+                    // Recalcula finished baseado no tempo real para exibição precisa
+                    bool finished = false;
+                    long lastOpEndMin = -1;
+                    if (assignedLineName != "Não Agendado")
+                    {
+                        var assignedLine = lines.First(l => l.Name == assignedLineName);
+                        var lineOps = assignedLine.GetAllOperationsInOrder();
+                        if (lineOps.Any())
+                        {
+                            var lastOpName = lineOps.Last().Name;
+                            if (endVars.TryGetValue((productName, lastOpName, assignedLineName), out var endVar))
+                            {
+                                lastOpEndMin = solver.Value(endVar);
+                                finished = lastOpEndMin <= deadlineMinutes;
+                            }
+                        }
+                    }
 
                     long firstOpStartMin = -1;
-                    long lastOpEndMin = -1;
-
                     if (assignedLineName != "Não Agendado")
                     {
                         var assignedLine = lines.First(l => l.Name == assignedLineName);
@@ -527,50 +461,45 @@ class Program
                         if (lineOps.Any())
                         {
                             var firstOpName = lineOps.First().Name;
-                            var lastOpName = lineOps.Last().Name;
-
-                            // Obtém tempos das variáveis específicas da linha usando SolverValue
-                            // Adiciona checagens de existência de chave para robustez
                             if (startVars.TryGetValue((productName, firstOpName, assignedLineName), out var startVar))
                             {
                                 firstOpStartMin = solver.Value(startVar);
                             }
-                            if (endVars.TryGetValue((productName, lastOpName, assignedLineName), out var endVar))
-                            {
-                                lastOpEndMin = solver.Value(endVar);
-                            }
                         }
                     }
-
 
                     var firstOpStartTime = startDate.AddMinutes(firstOpStartMin);
                     var lastOpEndTime = startDate.AddMinutes(lastOpEndMin);
 
-
                     string productStatus;
                     Console.WriteLine($"Produto: {productName} (Atribuído à Linha: {assignedLineName})");
 
-                    if (finished) // Se terminou no prazo, está finalizado.
+                    // Status baseado no tempo real de término
+                    if (finished)
                     {
                         productStatus = "FINALIZADO (dentro do deadline)";
                         Console.WriteLine($"  Status: {productStatus}");
-                        Console.WriteLine($"  Lucro Contribuído: {product.Price}");
+                        Console.WriteLine($"  Lucro Contribuído (base): {product.Price}");
                     }
-                    // Se está agendado (scheduled=true) mas não terminou no prazo (finished=false),
-                    // e a flag permitirAtraso era true, então ele foi concluído com atraso.
-                    // Se permitirAtraso fosse false, ele não teria sido agendado (scheduled seria false).
                     else
                     {
-                        productStatus = "CONCLUIDO APOS DEADLINE / PARCIALMENTE PLANEJADO";
-                        Console.WriteLine($"  Status: {productStatus}");
-                        // Não contribui para o lucro do objetivo.
+                        // Este bloco só deve ser alcançado se permitirAtraso = true
+                        // Se permitirAtraso = false, a restrição deveria ter impedido o agendamento.
+                        if (!permitirAtraso)
+                        {
+                            Console.WriteLine("  ERRO LÓGICO: Agendado mas atrasado quando não permitido!");
+                            productStatus = "ERRO";
+                        }
+                        else
+                        {
+                            productStatus = "CONCLUIDO APOS DEADLINE / PARCIALMENTE PLANEJADO";
+                            Console.WriteLine($"  Status: {productStatus}");
+                        }
                     }
 
-                    // Exibe detalhes das operações e tempos
                     Console.WriteLine($"  Primeira operação iniciada em: {firstOpStartTime:dd/MM/yyyy HH:mm} (Minuto {firstOpStartMin})");
                     Console.WriteLine($"  Data real de conclusão planejada: {lastOpEndTime:dd/MM/yyyy HH:mm} (Minuto {lastOpEndMin})");
 
-                    // Mostra detalhes das operações individuais
                     var assignedLineDetails = lines.First(l => l.Name == assignedLineName);
                     foreach (var operation in assignedLineDetails.GetAllOperationsInOrder())
                     {
@@ -585,11 +514,10 @@ class Program
                         }
                     }
 
-                    // Calcula e mostra o atraso se houver
-                    if (!finished && lastOpEndMin >= 0 && firstOpStartMin >= 0) // Apenas se terminou após deadline e tempos são válidos
+                    if (!finished && lastOpEndMin >= 0 && firstOpStartMin >= 0)
                     {
                         TimeSpan atraso = lastOpEndTime - deadlineDate;
-                        if (atraso.TotalMinutes > 0) // Mostra apenas atraso positivo
+                        if (atraso.TotalMinutes > 0)
                         {
                             Console.WriteLine($"  Tempo de Atraso: {atraso.TotalMinutes} minutos ({atraso.Days}d {atraso.Hours}h {atraso.Minutes}m)");
                         }
@@ -598,7 +526,6 @@ class Program
                 else // Se scheduled == false
                 {
                     Console.WriteLine($"Produto: {productName}");
-                    // Ajusta a mensagem dependendo da flag
                     if (!permitirAtraso)
                     {
                         Console.WriteLine($"  Status: NÃO AGENDADO (Terminaria após deadline ou não lucrativo)");
@@ -608,7 +535,7 @@ class Program
                         Console.WriteLine($"  Status: NÃO AGENDADO (Começaria após deadline ou não lucrativo)");
                     }
                 }
-                Console.WriteLine(); // Linha em branco entre produtos
+                Console.WriteLine();
             }
         }
         else
