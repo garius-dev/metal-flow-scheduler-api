@@ -1,0 +1,4 @@
+﻿-  Tempo de Setup
+-  Melhor agendamento pelo lucro
+-  Separação de work center
+-  sem overlap de work center e operação
