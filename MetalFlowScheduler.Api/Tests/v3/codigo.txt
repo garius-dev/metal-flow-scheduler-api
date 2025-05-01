@@ -68,10 +68,19 @@ public class WorkCenter
     {
         if (MachinesByType.TryGetValue(machineType, out var machinesOfType))
         {
-            // Retorna o setup máximo entre as máquinas desse tipo, ou 0 se não houver máquinas ou setups definidos
             return machinesOfType.Any() ? machinesOfType.Max(m => m.SetupTime) : 0;
         }
-        return 0; // Retorna 0 se o tipo de máquina não existe no WC
+        return 0;
+    }
+
+    // Helper para obter a capacidade total para um tipo de máquina neste WC
+    public decimal GetTotalCapacityForType(string machineType)
+    {
+        if (MachinesByType.TryGetValue(machineType, out var machinesOfType))
+        {
+            return machinesOfType.Sum(m => m.Capacity);
+        }
+        return 0M;
     }
 }
 
@@ -205,10 +214,10 @@ class Program
         var rotaPadrao = new List<string> { "Fusao", "Aquecimento", "Extrusao", "Corte" };
         var products = new List<Product>
         {
-            new Product("VAT30", 100, 50, rotaPadrao),
-            new Product("VD500", 100, 60, rotaPadrao),
-            new Product("SX650", 100, 70, rotaPadrao),
-            new Product("NEWPROD", 50, 80, rotaPadrao)
+            new Product("VAT30", 100, 50, rotaPadrao), // 100 tons
+            new Product("VD500", 100, 60, rotaPadrao), // 100 tons
+            new Product("SX650", 100, 70, rotaPadrao), // 100 tons
+            new Product("NEWPROD", 50, 80, rotaPadrao)  // 50 tons
         };
 
         // --- Criação do Modelo ---
@@ -313,6 +322,21 @@ class Program
                 var lineAssignVar = assignProdToLine[(productName, lineForThisStep.Name)];
                 var eligibleMachinesInWc = wcForThisStep.GetMachinesOfType(requiredMachineType);
 
+                // *** INÍCIO DA CORREÇÃO DE PARALELISMO ***
+                // Calcula a capacidade total para este tipo de máquina neste WC
+                decimal totalCapacityOfTypeInWC = wcForThisStep.GetTotalCapacityForType(requiredMachineType);
+                if (totalCapacityOfTypeInWC <= 0)
+                {
+                    Console.WriteLine($"ERRO: Capacidade total zero ou negativa para tipo {requiredMachineType} no WC {wcForThisStep.Name}.");
+                    possibleToSchedule = false;
+                    break; // Não pode continuar se a capacidade for inválida
+                }
+
+                // Calcula a duração baseada na capacidade TOTAL (paralela)
+                long duration = Math.Max(1, (long)Math.Ceiling(product.Quantity / totalCapacityOfTypeInWC * 60M));
+                if (duration <= 0) duration = 1; // Garante duração positiva
+                // *** FIM DA CORREÇÃO DE PARALELISMO ***
+
                 foreach (var machine in eligibleMachinesInWc)
                 {
                     var machineName = machine.Name;
@@ -322,11 +346,10 @@ class Program
 
                     model.AddImplication(stepMachineAssignVar, lineAssignVar);
 
-                    long duration = Math.Max(1, (long)Math.Ceiling(product.Quantity / machine.Capacity * 60M));
-                    if (duration <= 0) duration = 1;
-
+                    // Usa a duração calculada com base na capacidade total (paralela)
                     var start = model.NewIntVar(0, planningHorizonMinutes, $"Start_{productName}_Step{step}_{machineName}");
                     var end = model.NewIntVar(0, planningHorizonMinutes, $"End_{productName}_Step{step}_{machineName}");
+                    // Cria o intervalo com a duração ajustada para paralelismo
                     var interval = model.NewOptionalIntervalVar(start, duration, end, stepMachineAssignVar, $"Interval_{productName}_Step{step}_{machineName}");
 
                     stepStartVars[(productName, step, machineName)] = start;
@@ -340,7 +363,8 @@ class Program
                 }
                 else
                 {
-                    Console.WriteLine($"AVISO: Produto {productName} não tem máquinas elegíveis para a etapa {step} ({requiredMachineType}) no WC {wcForThisStep.Name}. Não poderá ser agendado.");
+                    // Esta verificação agora é redundante devido à verificação de capacidade total acima
+                    // Console.WriteLine($"AVISO: Produto {productName} não tem máquinas elegíveis para a etapa {step} ({requiredMachineType}) no WC {wcForThisStep.Name}. Não poderá ser agendado.");
                     possibleToSchedule = false;
                     break;
                 }
@@ -376,7 +400,6 @@ class Program
                 model.Add(wcDuration == wcEnd - wcStart).OnlyEnforceIf(productIsScheduled[productName]);
                 model.Add(wcDuration == 0).OnlyEnforceIf(productIsScheduled[productName].Not());
 
-                // Usa productIsScheduled como literal de presença para o intervalo do WC
                 var wcInterval = model.NewOptionalIntervalVar(wcStart, wcDuration, wcEnd, productIsScheduled[productName], $"WCInterval_{productName}_{wcName}");
                 wcIntervalVars[(productName, wcName)] = wcInterval;
 
@@ -525,24 +548,16 @@ class Program
                         var start2 = wcStartVars[(intervalInfo2.prod, wcName)];
                         var end2 = wcEndVars[(intervalInfo2.prod, wcName)];
 
-                        // CORREÇÃO: Obtém o literal de presença do dicionário productIsScheduled
                         var pres1 = productIsScheduled[intervalInfo1.prod];
                         var pres2 = productIsScheduled[intervalInfo2.prod];
 
-                        // Variável de ordem
                         var wc1BeforeWc2 = model.NewBoolVar($"WC_{wcName}_{intervalInfo1.prod}_Before_{intervalInfo2.prod}");
 
-                        // Determina o tempo de setup (máximo das máquinas do tipo da primeira etapa do produto que entra)
                         int setupTime12 = CalculateWcSetupTime(products.First(p => p.Name == intervalInfo2.prod), wcName, wcToStepsMap, stepToWcMap);
                         int setupTime21 = CalculateWcSetupTime(products.First(p => p.Name == intervalInfo1.prod), wcName, wcToStepsMap, stepToWcMap);
 
-                        // Se pres1 e pres2 são true, e wc1 vem antes de wc2, então start2 >= end1 + setupTime12
                         model.Add(start2 >= end1 + setupTime12).OnlyEnforceIf(new ILiteral[] { pres1, pres2, wc1BeforeWc2 });
-
-                        // Se pres1 e pres2 são true, e wc2 vem antes de wc1, então start1 >= end2 + setupTime21
                         model.Add(start1 >= end2 + setupTime21).OnlyEnforceIf(new ILiteral[] { pres1, pres2, wc1BeforeWc2.Not() });
-
-                        // Ligação entre a ordem real e a variável wc1BeforeWc2 (necessário por causa do setup)
                         model.Add(start2 >= end1).OnlyEnforceIf(new ILiteral[] { pres1, pres2, wc1BeforeWc2 });
                         model.Add(start1 >= end2).OnlyEnforceIf(new ILiteral[] { pres1, pres2, wc1BeforeWc2.Not() });
                     }
@@ -785,7 +800,6 @@ class Program
                 }
 
                 lineEntry.WorkCenters.Sort((a, b) => {
-                    // Trata WCs sem máquinas (não deveria acontecer com produtos agendados)
                     if (string.IsNullOrEmpty(a.StartTime)) return 1;
                     if (string.IsNullOrEmpty(b.StartTime)) return -1;
                     return DateTime.ParseExact(a.StartTime, DateTimeFormat, CultureInfo.InvariantCulture)
@@ -803,7 +817,6 @@ class Program
 
             timelineOutput.TimeLine = lineData.Values
                                         .OrderBy(l => {
-                                            // Trata linhas sem WCs agendados
                                             if (string.IsNullOrEmpty(l.StartTime)) return DateTime.MaxValue;
                                             return DateTime.ParseExact(l.StartTime, DateTimeFormat, CultureInfo.InvariantCulture);
                                         })
@@ -814,7 +827,7 @@ class Program
         // --- Exibe Resultados Console (Título atualizado) ---
         if (status == CpSolverStatus.Optimal || status == CpSolverStatus.Feasible)
         {
-            Console.WriteLine("\n--- Resultado do Agendamento (Setup por WC - Final Corrigido) ---"); // Título atualizado
+            Console.WriteLine("\n--- Resultado do Agendamento (Paralelismo Corrigido) ---"); // Título atualizado
             Console.WriteLine($"Status do Solver: {status}");
             Console.WriteLine($"Data de Início do Planejamento: {startDate.ToString(DateTimeFormat)}");
             Console.WriteLine($"Deadline: {deadlineDate.ToString(DateTimeFormat)} (Minuto {deadlineMinutes})");
@@ -964,39 +977,20 @@ class Program
                                             Dictionary<(string prod, string wcName), List<(int stepIdx, string machineType)>> wcToStepsMap,
                                             Dictionary<(string prod, int step), WorkCenter> stepToWcMap)
     {
-        // Encontra a primeira etapa do produto 'incomingProduct' que ocorre no WC 'wcName'
         if (!wcToStepsMap.TryGetValue((incomingProduct.Name, wcName), out var stepsInWc) || !stepsInWc.Any())
         {
-            // Console.WriteLine($"Debug: Produto {incomingProduct.Name} não tem etapas definidas para WC {wcName} no mapeamento.");
-            return 0; // Produto não tem etapas neste WC? Retorna 0 setup.
-        }
-
-        // Encontra o índice da primeira etapa deste produto neste WC
-        int firstStepIndexInWc = stepsInWc.Min(s => s.stepIdx);
-
-        // Encontra o tipo de máquina para essa primeira etapa
-        string firstMachineType = incomingProduct.Route[firstStepIndexInWc];
-
-        // Encontra o objeto WorkCenter correspondente a esta etapa
-        // Usa o mapeamento stepToWcMap que foi preenchido durante a criação das variáveis
-        if (!stepToWcMap.TryGetValue((incomingProduct.Name, firstStepIndexInWc), out var workCenter))
-        {
-            // Console.WriteLine($"Debug: Não encontrou WC para produto {incomingProduct.Name} etapa {firstStepIndexInWc} no mapeamento stepToWcMap.");
-            return 0; // Não deveria acontecer se chegou até aqui
-        }
-
-        // Verifica se o nome do WC encontrado no mapeamento corresponde ao wcName esperado
-        if (workCenter.Name != wcName)
-        {
-            // Console.WriteLine($"Debug: Inconsistência no mapeamento de WC para produto {incomingProduct.Name} etapa {firstStepIndexInWc}. Esperado: {wcName}, Encontrado: {workCenter.Name}");
-            // Tenta encontrar o WC pelo nome, se houver inconsistência (fallback)
-            // Isso requer acesso à lista global de WCs, o que não é ideal aqui.
-            // Melhor retornar 0 e investigar a causa da inconsistência.
             return 0;
         }
-
-
-        // Retorna o setup time máximo para aquele tipo de máquina naquele WC
+        int firstStepIndexInWc = stepsInWc.Min(s => s.stepIdx);
+        string firstMachineType = incomingProduct.Route[firstStepIndexInWc];
+        if (!stepToWcMap.TryGetValue((incomingProduct.Name, firstStepIndexInWc), out var workCenter))
+        {
+            return 0;
+        }
+        if (workCenter.Name != wcName)
+        {
+            return 0;
+        }
         return workCenter.GetMaxSetupTimeForType(firstMachineType);
     }
 }
