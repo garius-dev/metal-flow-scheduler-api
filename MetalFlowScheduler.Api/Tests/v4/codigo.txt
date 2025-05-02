@@ -1,0 +1,1009 @@
+﻿using Google.OrTools.Sat;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Globalization; // Para formatação de datas
+using Newtonsoft.Json; // Adicionar referência via NuGet
+
+// --- Estruturas de Dados com sufixo DTO ---
+
+public class ProductDTO
+{
+    public string Name { get; }
+    public int Quantity { get; } // Quantidade total desejada
+    public int Price { get; } // Lucro se finalizado no prazo
+    public List<string> Route { get; } // Sequência de TIPOS de operação (máquina)
+
+    public ProductDTO(string name, int quantity, int price, List<string> route)
+    {
+        Name = name;
+        Quantity = quantity;
+        Price = price;
+        Route = route ?? new List<string>();
+    }
+}
+
+public class MachineDTO
+{
+    public string Name { get; }      // Identificador único da máquina (ex: "Fusao_M1_L1")
+    public string Type { get; }      // Tipo funcional da máquina (ex: "Fusao")
+    public decimal Capacity { get; } // Capacidade de produção por hora
+    public int SetupTime { get; }   // Tempo de setup em minutos
+
+    public MachineDTO(string name, string type, decimal capacity, int setupTime)
+    {
+        Name = name;
+        Type = type;
+        Capacity = capacity;
+        SetupTime = setupTime;
+    }
+
+    public override string ToString() => Name;
+}
+
+public class WorkCenterDTO
+{
+    public string Name { get; }
+    public List<MachineDTO> Machines { get; }
+    public int MinBatchQuantity { get; } // Novo: Quantidade mínima do lote
+    // Mapeia tipo de máquina para máquinas desse tipo neste WC
+    public Dictionary<string, List<MachineDTO>> MachinesByType { get; }
+
+    // Construtor atualizado para incluir MinBatchQuantity
+    public WorkCenterDTO(string name, List<MachineDTO> machines, int minBatchQuantity = 0) // Default 0 = sem lote mínimo
+    {
+        Name = name;
+        Machines = machines ?? new List<MachineDTO>();
+        MinBatchQuantity = Math.Max(0, minBatchQuantity); // Garante não negativo
+        MachinesByType = Machines
+            .GroupBy(m => m.Type)
+            .ToDictionary(g => g.Key, g => g.ToList());
+    }
+
+    // Helper para encontrar máquinas de um tipo específico neste WC
+    public List<MachineDTO> GetMachinesOfType(string machineType)
+    {
+        return MachinesByType.TryGetValue(machineType, out var list) ? list : new List<MachineDTO>();
+    }
+
+    // Helper para obter o setup time máximo para um tipo de máquina neste WC
+    public int GetMaxSetupTimeForType(string machineType)
+    {
+        if (MachinesByType.TryGetValue(machineType, out var machinesOfType))
+        {
+            return machinesOfType.Any() ? machinesOfType.Max(m => m.SetupTime) : 0;
+        }
+        return 0;
+    }
+
+    // Helper para obter a capacidade total para um tipo de máquina neste WC
+    public decimal GetTotalCapacityForType(string machineType)
+    {
+        if (MachinesByType.TryGetValue(machineType, out var machinesOfType))
+        {
+            return machinesOfType.Sum(m => m.Capacity);
+        }
+        return 0M;
+    }
+}
+
+public class LineDTO
+{
+    public string Name { get; }
+    public List<WorkCenterDTO> WorkCenters { get; }
+    public HashSet<string> AllowedProducts { get; }
+
+    public LineDTO(string name, List<WorkCenterDTO> workCenters, IEnumerable<string> allowedProducts)
+    {
+        Name = name;
+        WorkCenters = workCenters ?? new List<WorkCenterDTO>();
+        AllowedProducts = new HashSet<string>(allowedProducts);
+    }
+
+    // Helper para encontrar todas as máquinas em uma linha
+    public List<MachineDTO> GetAllMachines()
+    {
+        return WorkCenters.SelectMany(wc => wc.Machines).ToList();
+    }
+
+    // Helper para encontrar máquinas elegíveis para um tipo de operação específico NESTA LINHA
+    public Dictionary<WorkCenterDTO, List<MachineDTO>> GetEligibleMachinesForTypeByWC(string machineType)
+    {
+        var result = new Dictionary<WorkCenterDTO, List<MachineDTO>>();
+        foreach (var wc in WorkCenters)
+        {
+            var machinesInWc = wc.GetMachinesOfType(machineType);
+            if (machinesInWc.Any())
+            {
+                result[wc] = machinesInWc;
+            }
+        }
+        return result;
+    }
+}
+
+// --- Estruturas para Saída JSON V2 com sufixo DTO ---
+public class ProductionPlanDTO
+{
+    public string ProductionPlanId { get; set; } = "1001";
+    public double TotalProfit { get; set; }
+    public string StartTime { get; set; }
+    public string DeadLine { get; set; }
+    public double TotalDelay { get; set; }
+    public List<TimelineEventDTO> TimeLine { get; set; } = new List<TimelineEventDTO>();
+}
+
+public class TimelineEventDTO
+{
+    public string StartTime { get; set; }
+    [JsonProperty("EndTine")]
+    public string EndTime { get; set; }
+    public string Product { get; set; }
+    public string Line { get; set; }
+    public string WorkCenter { get; set; }
+    public string Machine { get; set; }
+    public double Delay { get; set; }
+    public double TotalProduction { get; set; } // Representa a produção DESTE evento/lote
+}
+
+
+class Program
+{
+    // Constante para formatação de data/hora ISO 8601
+    private const string DateTimeFormatISO = "yyyy-MM-ddTHH:mm:ss";
+    // Constante para formatação de data/hora para console (opcional)
+    private const string DateTimeFormatConsole = "dd/MM/yyyy HH:mm";
+
+
+    static void Main()
+    {
+        // --- Dados de Entrada (Fácil Configuração Visual) ---
+        DateTime startDate = new DateTime(2025, 4, 29, 6, 0, 0);
+        int planningHorizonMinutes = 4 * 24 * 60; // Horizonte de planejamento (ex: 4 dias - aumentado para acomodar lotes)
+
+        // --- FLAG DE CONTROLE DE ATRASO ---
+        bool permitirAtraso = false; // Define se produtos podem terminar após o deadline (se começarem antes)
+        // ------------------------------------
+
+        DateTime deadlineDate = new DateTime(2025, 5, 1, 16, 0, 0); // Deadline
+        int deadlineMinutes = (int)(deadlineDate - startDate).TotalMinutes;
+        if (deadlineMinutes <= 0)
+        {
+            Console.WriteLine("Erro: Deadline deve ser posterior à data de início.");
+            return;
+        }
+        if (deadlineMinutes > planningHorizonMinutes)
+        {
+            Console.WriteLine($"Aviso: Deadline ({deadlineDate}) está além do horizonte de planejamento ({startDate.AddMinutes(planningHorizonMinutes)}). Ajustando horizonte.");
+            planningHorizonMinutes = deadlineMinutes + (24 * 60); // Adiciona margem maior
+        }
+
+
+        // --- Definição das Máquinas ---
+        // Linha 1
+        var fusaoM1_L1 = new MachineDTO("Fusao_M1_L1", "Fusao", 10M, 15);
+        var fusaoM2_L1 = new MachineDTO("Fusao_M2_L1", "Fusao", 10M, 10); // Capacidade Total Fusao L1 = 20
+        var aquecM1_L1 = new MachineDTO("Aquec_M1_L1", "Aquecimento", 10M, 20);
+        var extrusM1_L1 = new MachineDTO("Extrus_M1_L1", "Extrusao", 10M, 15);
+        var corteM1_L1 = new MachineDTO("Corte_M1_L1", "Corte", 10M, 5);
+        var corteM2_L1 = new MachineDTO("Corte_M2_L1", "Corte", 10M, 15); // Capacidade Total Corte L1 = 20
+
+        // Linha 2
+        var fusaoM1_L2 = new MachineDTO("Fusao_M1_L2", "Fusao", 9M, 18);
+        var aquecM1_L2 = new MachineDTO("Aquec_M1_L2", "Aquecimento", 11M, 12);
+        var extrusM1_L2 = new MachineDTO("Extrus_M1_L2", "Extrusao", 10M, 15);
+        var corteM1_L2 = new MachineDTO("Corte_M1_L2", "Corte", 14M, 6);
+
+        // --- Definição dos WorkCenters ---
+        // Adicionando MinBatchQuantity (exemplo: Aciaria_L1 requer lotes de 40)
+        var wc_Aciaria_L1 = new WorkCenterDTO("Aciaria_L1", new List<MachineDTO> { fusaoM1_L1, aquecM1_L1 }, minBatchQuantity: 40);
+        var wc_Lam_L1 = new WorkCenterDTO("Laminacao_L1", new List<MachineDTO> { extrusM1_L1, corteM1_L1, corteM2_L1 }); // Lote mínimo 0 (padrão)
+
+        var wc_Aciaria_L2 = new WorkCenterDTO("Aciaria_L2", new List<MachineDTO> { fusaoM1_L2, aquecM1_L2 });
+        var wc_Lam_L2 = new WorkCenterDTO("Laminacao_L2", new List<MachineDTO> { extrusM1_L2, corteM1_L2 });
+
+        // --- Definição das Linhas ---
+        var line1 = new LineDTO("Predio_01", new List<WorkCenterDTO> { wc_Aciaria_L1, wc_Lam_L1 }, new[] { "VAT30", "VD500", "SX650" });
+        var line2 = new LineDTO("Predio_02", new List<WorkCenterDTO> { wc_Aciaria_L2, wc_Lam_L2 }, new[] { "NEWPROD" });
+        var lines = new List<LineDTO> { line1, line2 };
+
+        // --- Definição dos Produtos com Rotas ---
+        var rotaPadrao = new List<string> { "Fusao", "Aquecimento", "Extrusao", "Corte" };
+        var products = new List<ProductDTO>
+        {
+            new ProductDTO("VAT30", 60, 50, rotaPadrao), // Exemplo: Quantidade 60
+            new ProductDTO("VD500", 100, 60, rotaPadrao),
+            new ProductDTO("SX650", 100, 70, rotaPadrao),
+            new ProductDTO("NEWPROD", 50, 80, rotaPadrao)
+        };
+        var productMap = products.ToDictionary(p => p.Name);
+
+        // --- Criação do Modelo ---
+        var model = new CpModel();
+
+        // --- Dicionários para Armazenar Variáveis e Dados Auxiliares ---
+        var productIsScheduled = new Dictionary<string, BoolVar>();
+        var assignProdToLine = new Dictionary<(string productName, string lineName), BoolVar>();
+        var assignStepToMachine = new Dictionary<(string prod, int step, string mach), BoolVar>();
+        var stepStartVars = new Dictionary<(string prod, int step, string mach), IntVar>();
+        var stepEndVars = new Dictionary<(string prod, int step, string mach), IntVar>();
+        var stepIntervalVars = new Dictionary<(string prod, int step, string mach), IntervalVar>();
+        var wcIntervalVars = new Dictionary<(string prod, string wcName), IntervalVar>();
+        var wcStartVars = new Dictionary<(string prod, string wcName), IntVar>();
+        var wcEndVars = new Dictionary<(string prod, string wcName), IntVar>();
+        var finishedByDeadlineVars = new Dictionary<string, BoolVar>();
+
+        var stepToWcMap = new Dictionary<(string prod, int step), WorkCenterDTO>();
+        var wcToStepsMap = new Dictionary<(string prod, string wcName), List<(int stepIdx, string machineType)>>();
+
+        var machineLocationMap = new Dictionary<string, (string wcName, string lineName)>();
+        foreach (var line in lines)
+        {
+            foreach (var wc in line.WorkCenters)
+            {
+                foreach (var machine in wc.Machines)
+                {
+                    machineLocationMap[machine.Name] = (wc.Name, line.Name);
+                }
+            }
+        }
+
+
+        // --- Criação das Variáveis de Decisão ---
+        // (Lógica inalterada)
+        foreach (var product in products)
+        {
+            var productName = product.Name;
+            productIsScheduled[productName] = model.NewBoolVar($"IsScheduled_{productName}");
+            finishedByDeadlineVars[productName] = model.NewBoolVar($"FinishedByDeadline_{productName}");
+
+            var possibleLinesForProduct = new List<BoolVar>();
+            var productRoute = product.Route;
+
+            // 1. Atribuição Produto -> Linha
+            foreach (var line in lines)
+            {
+                if (line.AllowedProducts.Contains(productName))
+                {
+                    var lineAssignVar = model.NewBoolVar($"Assign_{productName}_To_{line.Name}");
+                    assignProdToLine[(productName, line.Name)] = lineAssignVar;
+                    possibleLinesForProduct.Add(lineAssignVar);
+                }
+            }
+            if (possibleLinesForProduct.Any())
+            {
+                model.Add(LinearExpr.Sum(possibleLinesForProduct) == 1).OnlyEnforceIf(productIsScheduled[productName]);
+                model.Add(LinearExpr.Sum(possibleLinesForProduct) == 0).OnlyEnforceIf(productIsScheduled[productName].Not());
+            }
+            else
+            {
+                Console.WriteLine($"AVISO: Produto {productName} não é permitido em nenhuma linha. Não será agendado.");
+                model.Add(productIsScheduled[productName] == 0);
+                continue;
+            }
+
+            // 2. Variáveis de Etapa (Máquina) e Mapeamento Etapa -> WC
+            var stepsInWc = new Dictionary<string, List<(int stepIdx, string machineType)>>();
+            bool possibleToSchedule = true;
+            for (int step = 0; step < productRoute.Count; step++)
+            {
+                string requiredMachineType = productRoute[step];
+                var possibleMachinesForStep = new List<BoolVar>();
+                WorkCenterDTO wcForThisStep = null;
+
+                int stepsOfSameTypeBefore = 0;
+                for (int s = 0; s < step; ++s) { if (productRoute[s] == requiredMachineType) stepsOfSameTypeBefore++; }
+
+                WorkCenterDTO potentialWc = null;
+                LineDTO lineForThisStep = null;
+                foreach (var line in lines)
+                {
+                    if (!line.AllowedProducts.Contains(productName)) continue;
+
+                    int wcCountOfTypeFound = 0;
+                    foreach (var wc in line.WorkCenters)
+                    {
+                        if (wc.GetMachinesOfType(requiredMachineType).Any())
+                        {
+                            if (wcCountOfTypeFound == stepsOfSameTypeBefore)
+                            {
+                                potentialWc = wc;
+                                lineForThisStep = line;
+                                break;
+                            }
+                            wcCountOfTypeFound++;
+                        }
+                    }
+                    if (potentialWc != null) break;
+                }
+
+                if (potentialWc == null)
+                {
+                    Console.WriteLine($"AVISO: Produto {productName}, Etapa {step} ({requiredMachineType}) - Não foi possível encontrar um WC correspondente na sequência das linhas permitidas.");
+                    possibleToSchedule = false;
+                    break;
+                }
+                wcForThisStep = potentialWc;
+                stepToWcMap[(productName, step)] = wcForThisStep;
+
+                if (!stepsInWc.ContainsKey(wcForThisStep.Name)) stepsInWc[wcForThisStep.Name] = new List<(int stepIdx, string machineType)>();
+                stepsInWc[wcForThisStep.Name].Add((step, requiredMachineType));
+
+                var lineAssignVar = assignProdToLine[(productName, lineForThisStep.Name)];
+                var eligibleMachinesInWc = wcForThisStep.GetMachinesOfType(requiredMachineType);
+
+                decimal totalCapacityOfTypeInWC = wcForThisStep.GetTotalCapacityForType(requiredMachineType);
+                if (totalCapacityOfTypeInWC <= 0)
+                {
+                    Console.WriteLine($"ERRO: Capacidade total zero ou negativa para tipo {requiredMachineType} no WC {wcForThisStep.Name}.");
+                    possibleToSchedule = false;
+                    break;
+                }
+
+                // *** INÍCIO DA LÓGICA DE LOTE MÍNIMO ***
+                int quantityToProcess = product.Quantity;
+                if (wcForThisStep.MinBatchQuantity > 0)
+                {
+                    int numBatches = (int)Math.Ceiling((double)product.Quantity / wcForThisStep.MinBatchQuantity);
+                    quantityToProcess = numBatches * wcForThisStep.MinBatchQuantity;
+                }
+                // *** FIM DA LÓGICA DE LOTE MÍNIMO ***
+
+                long duration = Math.Max(1, (long)Math.Ceiling(quantityToProcess / totalCapacityOfTypeInWC * 60M));
+                if (duration <= 0) duration = 1;
+
+                foreach (var machine in eligibleMachinesInWc)
+                {
+                    var machineName = machine.Name;
+                    var stepMachineAssignVar = model.NewBoolVar($"Assign_{productName}_Step{step}_To_{machineName}");
+                    assignStepToMachine[(productName, step, machineName)] = stepMachineAssignVar;
+                    possibleMachinesForStep.Add(stepMachineAssignVar);
+
+                    model.AddImplication(stepMachineAssignVar, lineAssignVar);
+
+                    var start = model.NewIntVar(0, planningHorizonMinutes, $"Start_{productName}_Step{step}_{machineName}");
+                    var end = model.NewIntVar(0, planningHorizonMinutes, $"End_{productName}_Step{step}_{machineName}");
+                    var interval = model.NewOptionalIntervalVar(start, duration, end, stepMachineAssignVar, $"Interval_{productName}_Step{step}_{machineName}");
+
+                    stepStartVars[(productName, step, machineName)] = start;
+                    stepEndVars[(productName, step, machineName)] = end;
+                    stepIntervalVars[(productName, step, machineName)] = interval;
+                }
+
+                if (possibleMachinesForStep.Any())
+                {
+                    model.Add(LinearExpr.Sum(possibleMachinesForStep) == 1).OnlyEnforceIf(productIsScheduled[productName]);
+                }
+                else
+                {
+                    possibleToSchedule = false;
+                    break;
+                }
+            }
+
+            if (!possibleToSchedule)
+            {
+                model.Add(productIsScheduled[productName] == 0);
+                continue;
+            }
+
+            foreach (var kvp in stepsInWc) { wcToStepsMap[(productName, kvp.Key)] = kvp.Value; }
+
+            // 3. Variáveis de WorkCenter
+            var productWcs = stepToWcMap
+                .Where(kvp => kvp.Key.prod == productName)
+                .Select(kvp => kvp.Value)
+                .Distinct()
+                .ToList();
+
+            foreach (var wc in productWcs)
+            {
+                var wcName = wc.Name;
+                if (!wcToStepsMap.ContainsKey((productName, wcName))) continue;
+                var wcSteps = wcToStepsMap[(productName, wcName)];
+
+                var wcStart = model.NewIntVar(0, planningHorizonMinutes, $"WCStart_{productName}_{wcName}");
+                var wcEnd = model.NewIntVar(0, planningHorizonMinutes, $"WCEnd_{productName}_{wcName}");
+                wcStartVars[(productName, wcName)] = wcStart;
+                wcEndVars[(productName, wcName)] = wcEnd;
+
+                var wcDuration = model.NewIntVar(0, planningHorizonMinutes, $"WCDuration_{productName}_{wcName}");
+                model.Add(wcDuration == wcEnd - wcStart).OnlyEnforceIf(productIsScheduled[productName]);
+                model.Add(wcDuration == 0).OnlyEnforceIf(productIsScheduled[productName].Not());
+
+                var wcInterval = model.NewOptionalIntervalVar(wcStart, wcDuration, wcEnd, productIsScheduled[productName], $"WCInterval_{productName}_{wcName}");
+                wcIntervalVars[(productName, wcName)] = wcInterval;
+
+                var relevantMachineStarts = new List<IntVar>();
+                var relevantMachineEnds = new List<IntVar>();
+
+                foreach (var (stepIdx, machineType) in wcSteps)
+                {
+                    foreach (var machine in wc.GetMachinesOfType(machineType))
+                    {
+                        var key = (productName, stepIdx, machine.Name);
+                        if (stepStartVars.ContainsKey(key))
+                        {
+                            relevantMachineStarts.Add(stepStartVars[key]);
+                            relevantMachineEnds.Add(stepEndVars[key]);
+                        }
+                    }
+                }
+
+                if (!relevantMachineStarts.Any())
+                {
+                    Console.WriteLine($"AVISO: Produto {productName} não tem máquinas definidas para o WC {wcName}. Verifique a configuração.");
+                    model.Add(productIsScheduled[productName] == 0);
+                    continue;
+                }
+
+                var wcActualStart = model.NewIntVar(0, planningHorizonMinutes, $"WCActualStart_{productName}_{wcName}");
+                var wcActualEnd = model.NewIntVar(0, planningHorizonMinutes, $"WCActualEnd_{productName}_{wcName}");
+
+                model.AddMinEquality(wcActualStart, relevantMachineStarts);
+                model.AddMaxEquality(wcActualEnd, relevantMachineEnds);
+
+                model.Add(wcStart == wcActualStart).OnlyEnforceIf(productIsScheduled[productName]);
+                model.Add(wcEnd == wcActualEnd).OnlyEnforceIf(productIsScheduled[productName]);
+                model.Add(wcStart == 0).OnlyEnforceIf(productIsScheduled[productName].Not());
+                model.Add(wcEnd == 0).OnlyEnforceIf(productIsScheduled[productName].Not());
+            }
+        }
+
+
+        // --- Restrições (Lógica inalterada) ---
+
+        // 1. Sequência da Rota
+        foreach (var product in products)
+        {
+            var productName = product.Name;
+            var productRoute = product.Route;
+            var isScheduledVar = productIsScheduled[productName];
+
+            for (int step = 0; step < productRoute.Count - 1; step++)
+            {
+                if (!stepToWcMap.TryGetValue((productName, step), out var currentWc) ||
+                    !stepToWcMap.TryGetValue((productName, step + 1), out var nextWc))
+                {
+                    continue;
+                }
+
+                var currentStepEndVars = new List<IntVar>();
+                var nextStepStartVars = new List<IntVar>();
+
+                string currentMachineType = productRoute[step];
+                foreach (var machine in currentWc.GetMachinesOfType(currentMachineType))
+                {
+                    var key = (productName, step, machine.Name);
+                    if (stepEndVars.ContainsKey(key)) currentStepEndVars.Add(stepEndVars[key]);
+                }
+
+                string nextMachineType = productRoute[step + 1];
+                foreach (var machine in nextWc.GetMachinesOfType(nextMachineType))
+                {
+                    var key = (productName, step + 1, machine.Name);
+                    if (stepStartVars.ContainsKey(key)) nextStepStartVars.Add(stepStartVars[key]);
+                }
+
+                if (!currentStepEndVars.Any() || !nextStepStartVars.Any())
+                {
+                    continue;
+                }
+
+                var actualStepEnd = model.NewIntVar(0, planningHorizonMinutes, $"ActualEnd_{productName}_Step{step}");
+                var actualStepStart = model.NewIntVar(0, planningHorizonMinutes, $"ActualStart_{productName}_Step{step + 1}");
+
+                model.AddMaxEquality(actualStepEnd, currentStepEndVars);
+                model.AddMinEquality(actualStepStart, nextStepStartVars);
+
+                model.Add(actualStepStart >= actualStepEnd).OnlyEnforceIf(isScheduledVar);
+            }
+        }
+
+        // 2. Não Sobreposição em Máquinas Individuais (R1) - SEM SETUP AQUI
+        var allMachinesDict = lines.SelectMany(l => l.GetAllMachines()).Distinct().ToDictionary(m => m.Name);
+        var machineSteps = new Dictionary<string, List<(string prod, int step, IntervalVar interval, BoolVar assignVar)>>();
+
+        foreach (var kvp in stepIntervalVars)
+        {
+            string machineName = kvp.Key.mach;
+            if (!machineSteps.ContainsKey(machineName)) machineSteps[machineName] = new List<(string prod, int step, IntervalVar interval, BoolVar assignVar)>();
+            machineSteps[machineName].Add((kvp.Key.prod, kvp.Key.step, kvp.Value, assignStepToMachine[kvp.Key]));
+        }
+
+        foreach (var kvp in machineSteps)
+        {
+            if (kvp.Value.Count > 1)
+            {
+                model.AddNoOverlap(kvp.Value.Select(s => s.interval));
+            }
+        }
+
+
+        // 3. Não Sobreposição e Setup em WorkCenters (R2, C7, C8 - Setup no WC)
+        var wcIntervalsByWc = new Dictionary<string, List<(string prod, IntervalVar interval)>>();
+        foreach (var kvp in wcIntervalVars)
+        {
+            string wcName = kvp.Key.wcName;
+            if (!wcIntervalsByWc.ContainsKey(wcName)) wcIntervalsByWc[wcName] = new List<(string prod, IntervalVar interval)>();
+            wcIntervalsByWc[wcName].Add((kvp.Key.prod, kvp.Value));
+        }
+
+        foreach (var kvp in wcIntervalsByWc)
+        {
+            var wcName = kvp.Key;
+            var intervalsInWc = kvp.Value;
+            if (intervalsInWc.Count > 1)
+            {
+                model.AddNoOverlap(intervalsInWc.Select(i => i.interval));
+
+                for (int i = 0; i < intervalsInWc.Count; i++)
+                {
+                    for (int j = i + 1; j < intervalsInWc.Count; j++)
+                    {
+                        var intervalInfo1 = intervalsInWc[i];
+                        var intervalInfo2 = intervalsInWc[j];
+
+                        if (intervalInfo1.prod == intervalInfo2.prod) continue;
+
+                        var interval1 = intervalInfo1.interval;
+                        var interval2 = intervalInfo2.interval;
+                        var start1 = wcStartVars[(intervalInfo1.prod, wcName)];
+                        var end1 = wcEndVars[(intervalInfo1.prod, wcName)];
+                        var start2 = wcStartVars[(intervalInfo2.prod, wcName)];
+                        var end2 = wcEndVars[(intervalInfo2.prod, wcName)];
+
+                        var pres1 = productIsScheduled[intervalInfo1.prod];
+                        var pres2 = productIsScheduled[intervalInfo2.prod];
+
+                        var wc1BeforeWc2 = model.NewBoolVar($"WC_{wcName}_{intervalInfo1.prod}_Before_{intervalInfo2.prod}");
+
+                        int setupTime12 = CalculateWcSetupTime(products.First(p => p.Name == intervalInfo2.prod), wcName, wcToStepsMap, stepToWcMap);
+                        int setupTime21 = CalculateWcSetupTime(products.First(p => p.Name == intervalInfo1.prod), wcName, wcToStepsMap, stepToWcMap);
+
+                        model.Add(start2 >= end1 + setupTime12).OnlyEnforceIf(new ILiteral[] { pres1, pres2, wc1BeforeWc2 });
+                        model.Add(start1 >= end2 + setupTime21).OnlyEnforceIf(new ILiteral[] { pres1, pres2, wc1BeforeWc2.Not() });
+                        model.Add(start2 >= end1).OnlyEnforceIf(new ILiteral[] { pres1, pres2, wc1BeforeWc2 });
+                        model.Add(start1 >= end2).OnlyEnforceIf(new ILiteral[] { pres1, pres2, wc1BeforeWc2.Not() });
+                    }
+                }
+            }
+        }
+
+
+        // 4. Sequência de WorkCenters (C5, C6)
+        foreach (var product in products)
+        {
+            var productName = product.Name;
+            var isScheduledVar = productIsScheduled[productName];
+
+            foreach (var line in lines)
+            {
+                if (!line.AllowedProducts.Contains(productName)) continue;
+
+                var lineAssignVar = assignProdToLine[(productName, line.Name)];
+                var wcsInLine = line.WorkCenters;
+
+                for (int wcIdx = 0; wcIdx < wcsInLine.Count - 1; wcIdx++)
+                {
+                    var currentWc = wcsInLine[wcIdx];
+                    var nextWc = wcsInLine[wcIdx + 1];
+
+                    if (wcEndVars.ContainsKey((productName, currentWc.Name)) &&
+                        wcStartVars.ContainsKey((productName, nextWc.Name)))
+                    {
+                        model.Add(wcStartVars[(productName, nextWc.Name)] >= wcEndVars[(productName, currentWc.Name)])
+                             .OnlyEnforceIf(new ILiteral[] { isScheduledVar, lineAssignVar });
+                    }
+                }
+            }
+        }
+
+
+        // 5. Restrições de Deadline (R4 - Usando Início/Fim GLOBAIS do produto)
+        foreach (var product in products)
+        {
+            var productName = product.Name;
+            var isScheduledVar = productIsScheduled[productName];
+            var finishedVar = finishedByDeadlineVars[productName];
+
+            IntVar productStartTime = null;
+            IntVar productEndTime = null;
+            var relevantWcStarts = new List<IntVar>();
+            var relevantWcEnds = new List<IntVar>();
+
+            foreach (var line in lines)
+            {
+                if (!line.AllowedProducts.Contains(productName)) continue;
+
+                var lineAssignVar = assignProdToLine[(productName, line.Name)];
+                WorkCenterDTO firstWcOnLine = null;
+                WorkCenterDTO lastWcOnLine = null;
+
+                for (int step = 0; step < product.Route.Count; ++step)
+                {
+                    if (stepToWcMap.TryGetValue((productName, step), out var wcForStep) && line.WorkCenters.Contains(wcForStep))
+                    {
+                        if (firstWcOnLine == null || line.WorkCenters.IndexOf(wcForStep) < line.WorkCenters.IndexOf(firstWcOnLine)) firstWcOnLine = wcForStep;
+                        if (lastWcOnLine == null || line.WorkCenters.IndexOf(wcForStep) > line.WorkCenters.IndexOf(lastWcOnLine)) lastWcOnLine = wcForStep;
+                    }
+                }
+
+                if (firstWcOnLine != null && lastWcOnLine != null &&
+                    wcStartVars.ContainsKey((productName, firstWcOnLine.Name)) &&
+                    wcEndVars.ContainsKey((productName, lastWcOnLine.Name)))
+                {
+                    var startIfLine = model.NewIntVar(0, planningHorizonMinutes, $"StartIf_{line.Name}_{productName}");
+                    model.Add(startIfLine == wcStartVars[(productName, firstWcOnLine.Name)]).OnlyEnforceIf(lineAssignVar);
+                    model.Add(startIfLine == 0).OnlyEnforceIf(lineAssignVar.Not());
+                    relevantWcStarts.Add(startIfLine);
+
+                    var endIfLine = model.NewIntVar(0, planningHorizonMinutes, $"EndIf_{line.Name}_{productName}");
+                    model.Add(endIfLine == wcEndVars[(productName, lastWcOnLine.Name)]).OnlyEnforceIf(lineAssignVar);
+                    model.Add(endIfLine == 0).OnlyEnforceIf(lineAssignVar.Not());
+                    relevantWcEnds.Add(endIfLine);
+                }
+            }
+
+            if (relevantWcStarts.Any() && relevantWcEnds.Any())
+            {
+                productStartTime = model.NewIntVar(0, planningHorizonMinutes, $"ProductStart_{productName}");
+                productEndTime = model.NewIntVar(0, planningHorizonMinutes, $"ProductEnd_{productName}");
+                model.AddMaxEquality(productStartTime, relevantWcStarts);
+                model.AddMaxEquality(productEndTime, relevantWcEnds);
+
+                var endTimeLEDeadlineVar = model.NewBoolVar($"EndTimeLEDeadline_{productName}");
+                model.Add(productEndTime <= deadlineMinutes).OnlyEnforceIf(endTimeLEDeadlineVar);
+                model.Add(productEndTime > deadlineMinutes).OnlyEnforceIf(endTimeLEDeadlineVar.Not());
+                model.AddBoolAnd(new[] { isScheduledVar, endTimeLEDeadlineVar }).OnlyEnforceIf(finishedVar);
+                model.AddImplication(finishedVar, isScheduledVar);
+                model.AddImplication(finishedVar, endTimeLEDeadlineVar);
+
+                var startTimeGTDeadlineVar = model.NewBoolVar($"StartTimeGTDeadline_{productName}");
+                model.Add(productStartTime > deadlineMinutes).OnlyEnforceIf(startTimeGTDeadlineVar);
+                model.Add(productStartTime <= deadlineMinutes).OnlyEnforceIf(startTimeGTDeadlineVar.Not());
+
+                if (permitirAtraso)
+                {
+                    model.AddImplication(isScheduledVar, startTimeGTDeadlineVar.Not());
+                }
+                else
+                {
+                    model.AddImplication(isScheduledVar, finishedVar);
+                }
+            }
+            else
+            {
+                model.Add(finishedVar == 0);
+            }
+        }
+
+
+        // --- Função Objetivo ---
+        LinearExpr objective = LinearExpr.Sum(products.Select(p =>
+            finishedByDeadlineVars.ContainsKey(p.Name) ? finishedByDeadlineVars[p.Name] * p.Price : LinearExpr.Constant(0)
+        ));
+        model.Maximize(objective);
+
+
+        // --- Resolve ---
+        var solver = new CpSolver();
+        solver.StringParameters = "max_time_in_seconds:120.0; log_search_progress: true; num_workers: 8;";
+        Console.WriteLine("Iniciando solver...");
+        var status = solver.Solve(model);
+        Console.WriteLine("Solver finalizado.");
+
+        // --- Coleta de Dados para JSON V2 (com Lotes) ---
+        var productionPlan = new ProductionPlanDTO
+        {
+            StartTime = startDate.ToString(DateTimeFormatISO),
+            DeadLine = deadlineDate.ToString(DateTimeFormatISO)
+        };
+        var timelineEvents = new List<TimelineEventDTO>();
+        double totalCalculatedDelay = 0;
+        var productFinalEndTimes = new Dictionary<string, DateTime>();
+
+        if (status == CpSolverStatus.Optimal || status == CpSolverStatus.Feasible)
+        {
+            productionPlan.TotalProfit = solver.ObjectiveValue;
+
+            foreach (var product in products)
+            {
+                var productName = product.Name;
+                if (!productIsScheduled.TryGetValue(productName, out var scheduledVar) || solver.Value(scheduledVar) != 1)
+                    continue;
+
+                DateTime lastEventEndTime = DateTime.MinValue;
+
+                for (int step = 0; step < product.Route.Count; step++)
+                {
+                    string requiredType = product.Route[step];
+                    if (stepToWcMap.TryGetValue((productName, step), out var wcForStep))
+                    {
+                        foreach (var machine in wcForStep.GetMachinesOfType(requiredType))
+                        {
+                            var key = (productName, step, machine.Name);
+                            if (assignStepToMachine.TryGetValue(key, out var assignStepVar) && solver.Value(assignStepVar) == 1)
+                            {
+                                if (stepStartVars.TryGetValue(key, out var sVar) && stepEndVars.TryGetValue(key, out var eVar))
+                                {
+                                    long startMin = solver.Value(sVar);
+                                    long endMin = solver.Value(eVar);
+                                    DateTime stepStartTimeOverall = startDate.AddMinutes(startMin);
+                                    DateTime stepEndTimeOverall = startDate.AddMinutes(endMin);
+                                    long totalDurationMinutes = endMin - startMin; // Duração total calculada pelo solver
+
+                                    string lineName = "N/A";
+                                    string wcName = "N/A";
+                                    if (machineLocationMap.TryGetValue(machine.Name, out var location))
+                                    {
+                                        lineName = location.lineName;
+                                        wcName = location.wcName;
+                                    }
+
+                                    // *** LÓGICA DE GERAÇÃO DE EVENTOS POR LOTE (CORRIGIDA V2) ***
+                                    int minBatchQty = wcForStep.MinBatchQuantity;
+                                    decimal totalCapacity = wcForStep.GetTotalCapacityForType(requiredType); // Capacidade paralela
+
+                                    if (minBatchQty > 0 && totalCapacity > 0) // Verifica capacidade > 0
+                                    {
+                                        int originalQty = product.Quantity;
+                                        // Calcula o número de lotes com base na quantidade ORIGINAL e lote mínimo
+                                        int numBatches = (int)Math.Ceiling((double)originalQty / minBatchQty);
+                                        int batchQty = minBatchQty; // Produção por lote é sempre o mínimo
+
+                                        // Calcula duração por lote individual usando a capacidade total e a quantidade do lote
+                                        long batchDurationMinutes = Math.Max(1, (long)Math.Ceiling(batchQty / totalCapacity * 60M));
+                                        if (batchDurationMinutes <= 0) batchDurationMinutes = 1;
+
+                                        DateTime currentBatchStartTime = stepStartTimeOverall;
+                                        for (int i = 0; i < numBatches; i++)
+                                        {
+                                            // O fim do lote é o início + duração calculada por lote
+                                            DateTime batchEndTime = currentBatchStartTime.AddMinutes(batchDurationMinutes);
+
+                                            // Ajuste final: Garante que o fim do último lote coincida com o fim total calculado pelo solver
+                                            // Isso absorve pequenas discrepâncias de arredondamento.
+                                            if (i == numBatches - 1)
+                                            {
+                                                batchEndTime = stepEndTimeOverall;
+                                            }
+                                            // Evita que lotes intermediários ultrapassem o fim total (caso raro de arredondamento)
+                                            else if (batchEndTime > stepEndTimeOverall)
+                                            {
+                                                batchEndTime = stepEndTimeOverall;
+                                            }
+
+
+                                            double batchDelay = Math.Max(0, (batchEndTime - deadlineDate).TotalMinutes);
+
+                                            timelineEvents.Add(new TimelineEventDTO
+                                            {
+                                                StartTime = currentBatchStartTime.ToString(DateTimeFormatISO),
+                                                EndTime = batchEndTime.ToString(DateTimeFormatISO),
+                                                Product = productName,
+                                                Line = lineName,
+                                                WorkCenter = wcName,
+                                                Machine = machine.Name, // Máquina "representante"
+                                                Delay = Math.Round(batchDelay, 2),
+                                                TotalProduction = batchQty // Sempre a quantidade do lote mínimo
+                                            });
+                                            lastEventEndTime = batchEndTime > lastEventEndTime ? batchEndTime : lastEventEndTime;
+                                            currentBatchStartTime = batchEndTime; // Próximo lote começa onde o anterior terminou
+                                        }
+                                    }
+                                    else // Sem lote mínimo ou capacidade inválida
+                                    {
+                                        double stepDelay = Math.Max(0, (stepEndTimeOverall - deadlineDate).TotalMinutes);
+                                        timelineEvents.Add(new TimelineEventDTO
+                                        {
+                                            StartTime = stepStartTimeOverall.ToString(DateTimeFormatISO),
+                                            EndTime = stepEndTimeOverall.ToString(DateTimeFormatISO),
+                                            Product = productName,
+                                            Line = lineName,
+                                            WorkCenter = wcName,
+                                            Machine = machine.Name,
+                                            Delay = Math.Round(stepDelay, 2),
+                                            TotalProduction = product.Quantity // Produção total da etapa
+                                        });
+                                        lastEventEndTime = stepEndTimeOverall > lastEventEndTime ? stepEndTimeOverall : lastEventEndTime;
+                                    }
+                                    // *** FIM DA LÓGICA DE LOTE ***
+                                }
+                                break; // Só uma máquina é atribuída por etapa
+                            }
+                        }
+                    }
+                }
+                // Guarda o tempo de fim do último evento do produto
+                if (lastEventEndTime > DateTime.MinValue)
+                {
+                    productFinalEndTimes[productName] = lastEventEndTime;
+                }
+            }
+
+            // Calcula o atraso total somando os atrasos dos produtos que terminaram tarde
+            foreach (var kvp in productFinalEndTimes)
+            {
+                if (kvp.Value > deadlineDate)
+                {
+                    totalCalculatedDelay += Math.Round((kvp.Value - deadlineDate).TotalMinutes, 2);
+                }
+            }
+            productionPlan.TotalDelay = totalCalculatedDelay;
+
+
+            // Ordena a timeline final por StartTime
+            timelineEvents.Sort((a, b) => DateTime.ParseExact(a.StartTime, DateTimeFormatISO, CultureInfo.InvariantCulture)
+                                        .CompareTo(DateTime.ParseExact(b.StartTime, DateTimeFormatISO, CultureInfo.InvariantCulture)));
+            productionPlan.TimeLine = timelineEvents;
+        }
+
+
+        // --- Exibe Resultados Console (Título atualizado) ---
+        if (status == CpSolverStatus.Optimal || status == CpSolverStatus.Feasible)
+        {
+            Console.WriteLine("\n--- Resultado do Agendamento (Lote Mínimo V3) ---"); // Título atualizado
+            Console.WriteLine($"Status do Solver: {status}");
+            Console.WriteLine($"Data de Início do Planejamento: {startDate.ToString(DateTimeFormatConsole)}");
+            Console.WriteLine($"Deadline: {deadlineDate.ToString(DateTimeFormatConsole)} (Minuto {deadlineMinutes})");
+            Console.WriteLine($"Permitir Atraso: {(permitirAtraso ? "SIM" : "NÃO")}");
+            Console.WriteLine($"Valor Objetivo (Lucro Máximo): {solver.ObjectiveValue}\n");
+
+            var sortedProducts = products.OrderBy(p => p.Name);
+
+            foreach (var product in sortedProducts)
+            {
+                var productName = product.Name;
+                bool scheduled = productIsScheduled.TryGetValue(productName, out var scheduledVar) &&
+                                 solver.Value(scheduledVar) == 1;
+
+                if (scheduled)
+                {
+                    string assignedLineName = "N/A";
+                    foreach (var line in lines)
+                    {
+                        if (assignProdToLine.TryGetValue((productName, line.Name), out var assignVar) &&
+                            solver.Value(assignVar) == 1)
+                        {
+                            assignedLineName = line.Name;
+                            break;
+                        }
+                    }
+
+                    bool finishedOnTime = finishedByDeadlineVars.TryGetValue(productName, out var finVar) &&
+                                    solver.Value(finVar) == 1;
+
+                    string productStatus;
+                    if (finishedOnTime) { productStatus = "FINALIZADO (dentro do deadline)"; }
+                    else { productStatus = permitirAtraso ? "CONCLUÍDO (com atraso)" : "ERRO LÓGICO (Agendado sem permitir atraso)"; }
+
+                    Console.WriteLine($"Produto: {productName} (Linha: {assignedLineName})");
+                    Console.WriteLine($"  Status: {productStatus}");
+                    if (finishedOnTime) Console.WriteLine($"  Lucro Contribuído (base): {product.Price}");
+
+                    long productStartMin = -1;
+                    long productEndMin = -1;
+                    DateTime productStartTime = DateTime.MinValue;
+                    DateTime productEndTime = DateTime.MinValue;
+
+                    LineDTO assignedLine = lines.FirstOrDefault(l => l.Name == assignedLineName);
+                    WorkCenterDTO firstWc = null;
+                    WorkCenterDTO lastWc = null;
+                    if (assignedLine != null)
+                    {
+                        for (int step = 0; step < product.Route.Count; ++step)
+                        {
+                            if (stepToWcMap.TryGetValue((productName, step), out var wcForStep) && assignedLine.WorkCenters.Contains(wcForStep))
+                            {
+                                if (firstWc == null || assignedLine.WorkCenters.IndexOf(wcForStep) < assignedLine.WorkCenters.IndexOf(firstWc)) firstWc = wcForStep;
+                                if (lastWc == null || assignedLine.WorkCenters.IndexOf(wcForStep) > assignedLine.WorkCenters.IndexOf(lastWc)) lastWc = wcForStep;
+                            }
+                        }
+                    }
+
+                    if (firstWc != null && lastWc != null &&
+                        wcStartVars.TryGetValue((productName, firstWc.Name), out var startVar) &&
+                        wcEndVars.TryGetValue((productName, lastWc.Name), out var endVar))
+                    {
+                        productStartMin = solver.Value(startVar);
+                        productEndMin = solver.Value(endVar);
+                        productStartTime = startDate.AddMinutes(productStartMin);
+                        productEndTime = startDate.AddMinutes(productEndMin);
+                    }
+
+                    for (int step = 0; step < product.Route.Count; step++)
+                    {
+                        string requiredType = product.Route[step];
+                        string assignedMachineName = "N/A";
+                        long startMin = -1, endMin = -1;
+                        DateTime startTime = DateTime.MinValue, endTime = DateTime.MinValue;
+
+                        if (stepToWcMap.TryGetValue((productName, step), out var wcForStep))
+                        {
+                            foreach (var machine in wcForStep.GetMachinesOfType(requiredType))
+                            {
+                                var key = (productName, step, machine.Name);
+                                if (assignStepToMachine.TryGetValue(key, out var assignStepVar) && solver.Value(assignStepVar) == 1)
+                                {
+                                    assignedMachineName = machine.Name;
+                                    if (stepStartVars.TryGetValue(key, out var sVar) && stepEndVars.TryGetValue(key, out var eVar))
+                                    {
+                                        startMin = solver.Value(sVar);
+                                        endMin = solver.Value(eVar);
+                                        startTime = startDate.AddMinutes(startMin);
+                                        endTime = startDate.AddMinutes(endMin);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        Console.WriteLine($"    Etapa {step} ({requiredType}) -> Máquina: {assignedMachineName} | {startTime.ToString(DateTimeFormatConsole)} (Min {startMin}) -> {endTime.ToString(DateTimeFormatConsole)} (Min {endMin})");
+                    }
+
+                    Console.WriteLine($"  Início real do produto: {productStartTime.ToString(DateTimeFormatConsole)} (Minuto {productStartMin})");
+                    Console.WriteLine($"  Fim real do produto: {productEndTime.ToString(DateTimeFormatConsole)} (Minuto {productEndMin})");
+
+                    if (productFinalEndTimes.TryGetValue(productName, out DateTime finalEndTime) && finalEndTime > deadlineDate)
+                    {
+                        TimeSpan atraso = finalEndTime - deadlineDate;
+                        Console.WriteLine($"  Tempo de Atraso: {Math.Round(atraso.TotalMinutes)} minutos ({atraso.Days}d {atraso.Hours}h {atraso.Minutes}m)");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"Produto: {productName}");
+                    bool canBeMade = products.Any(p => p.Name == productName &&
+                                                     lines.Any(l => l.AllowedProducts.Contains(productName) &&
+                                                                    p.Route.All(rt => l.GetEligibleMachinesForTypeByWC(rt).Any())));
+                    if (!canBeMade) { Console.WriteLine($"  Status: NÃO AGENDADO (Impossível fabricar - verifique rota/máquinas/linhas)"); }
+                    else if (!permitirAtraso) { Console.WriteLine($"  Status: NÃO AGENDADO (Terminaria após deadline ou não lucrativo)"); }
+                    else { Console.WriteLine($"  Status: NÃO AGENDADO (Não lucrativo ou conflito irresolvível)"); }
+                }
+                Console.WriteLine();
+            }
+        }
+        else
+        {
+            Console.WriteLine("\nNenhuma solução viável encontrada ou solução ótima não encontrada dentro do tempo limite.");
+            Console.WriteLine($"Status do Solver: {status}");
+        }
+
+        // --- Geração e Impressão do JSON ---
+        try
+        {
+            string jsonOutput = JsonConvert.SerializeObject(productionPlan, Formatting.Indented);
+            Console.WriteLine("\n--- Saída JSON da Timeline (Formato V2 - Lote Mínimo Corrigido V2) ---");
+            Console.WriteLine(jsonOutput);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\nErro ao gerar JSON: {ex.Message}");
+        }
+
+        Console.WriteLine("\nTeste do Solver concluído. Pressione Enter para sair.");
+        Console.ReadLine();
+    }
+
+    // Função auxiliar para calcular o tempo de setup na troca de produto em um WC
+    private static int CalculateWcSetupTime(ProductDTO incomingProduct, string wcName,
+                                            Dictionary<(string prod, string wcName), List<(int stepIdx, string machineType)>> wcToStepsMap,
+                                            Dictionary<(string prod, int step), WorkCenterDTO> stepToWcMap)
+    {
+        if (!wcToStepsMap.TryGetValue((incomingProduct.Name, wcName), out var stepsInWc) || !stepsInWc.Any())
+        {
+            return 0;
+        }
+        int firstStepIndexInWc = stepsInWc.Min(s => s.stepIdx);
+        string firstMachineType = incomingProduct.Route[firstStepIndexInWc];
+        if (!stepToWcMap.TryGetValue((incomingProduct.Name, firstStepIndexInWc), out var workCenter))
+        {
+            return 0;
+        }
+        if (workCenter.Name != wcName)
+        {
+            return 0;
+        }
+        return workCenter.GetMaxSetupTimeForType(firstMachineType);
+    }
+}
