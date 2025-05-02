@@ -1,0 +1,1 @@
+﻿- min quantity do workcenter (lotes) [correção em teste]
